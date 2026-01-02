@@ -181,3 +181,89 @@ eval_context_isolation_test() ->
     ?assertEqual({ok, 100}, duktape:eval(Ctx1, <<"x">>)),
     ok = duktape:destroy_context(Ctx1),
     ok = duktape:destroy_context(Ctx2).
+
+%% ============================================================================
+%% Test: eval/3 with bindings
+%% ============================================================================
+
+eval_bindings_integer_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, 30}, duktape:eval(Ctx, <<"x * y">>, #{<<"x">> => 5, <<"y">> => 6})),
+    ?assertEqual({ok, 15}, duktape:eval(Ctx, <<"a + b + c">>, #{<<"a">> => 5, <<"b">> => 7, <<"c">> => 3})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_float_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, 6.28}, duktape:eval(Ctx, <<"pi * 2">>, #{<<"pi">> => 3.14})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_string_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, <<"hello world">>},
+                 duktape:eval(Ctx, <<"greeting + ' ' + name">>,
+                              #{<<"greeting">> => <<"hello">>, <<"name">> => <<"world">>})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_boolean_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, true}, duktape:eval(Ctx, <<"flag">>, #{<<"flag">> => true})),
+    ?assertEqual({ok, false}, duktape:eval(Ctx, <<"flag">>, #{<<"flag">> => false})),
+    ?assertEqual({ok, true}, duktape:eval(Ctx, <<"a && b">>, #{<<"a">> => true, <<"b">> => true})),
+    ?assertEqual({ok, false}, duktape:eval(Ctx, <<"a && b">>, #{<<"a">> => true, <<"b">> => false})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_null_undefined_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, null}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => null})),
+    ?assertEqual({ok, undefined}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => undefined})),
+    ?assertEqual({ok, true}, duktape:eval(Ctx, <<"x === null">>, #{<<"x">> => null})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_atom_key_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Atom keys should work
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"x">>, #{x => 10})),
+    ?assertEqual({ok, 30}, duktape:eval(Ctx, <<"x + y">>, #{x => 10, y => 20})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_atom_value_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Non-special atoms become strings
+    ?assertEqual({ok, <<"hello">>}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => hello})),
+    ?assertEqual({ok, <<"foo">>}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => foo})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_map_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Maps become objects
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"obj.x">>, #{<<"obj">> => #{<<"x">> => 10}})),
+    ?assertEqual({ok, <<"bar">>}, duktape:eval(Ctx, <<"obj.foo">>,
+                                                #{<<"obj">> => #{<<"foo">> => <<"bar">>}})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_nested_map_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Nested = #{<<"a">> => #{<<"b">> => #{<<"c">> => 42}}},
+    ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"obj.a.b.c">>, #{<<"obj">> => Nested})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_tuple_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Tuples become arrays
+    ?assertEqual({ok, 1}, duktape:eval(Ctx, <<"arr[0]">>, #{<<"arr">> => {1, 2, 3}})),
+    ?assertEqual({ok, 3}, duktape:eval(Ctx, <<"arr[2]">>, #{<<"arr">> => {1, 2, 3}})),
+    ?assertEqual({ok, 3}, duktape:eval(Ctx, <<"arr.length">>, #{<<"arr">> => {1, 2, 3}})),
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_persist_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Bindings should persist in context
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => 10})),
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"x">>)),  %% Still accessible
+    ok = duktape:destroy_context(Ctx).
+
+eval_bindings_empty_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Empty bindings should work
+    ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"42">>, #{})),
+    ok = duktape:destroy_context(Ctx).

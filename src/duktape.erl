@@ -22,11 +22,12 @@
     info/0,
     new_context/0,
     destroy_context/1,
-    eval/2
+    eval/2,
+    eval/3
 ]).
 
 %% Types
--export_type([context/0, js_value/0]).
+-export_type([context/0, js_value/0, bindings/0]).
 
 -opaque context() :: reference().
 
@@ -36,7 +37,11 @@
                   | true
                   | false
                   | null
-                  | undefined.
+                  | undefined
+                  | list(js_value())
+                  | #{binary() | atom() => js_value()}.
+
+-type bindings() :: #{atom() | binary() => term()}.
 
 %% NIF loading
 -compile(no_native).
@@ -92,6 +97,28 @@ destroy_context(Ctx) ->
 eval(Ctx, Code) ->
     nif_eval(Ctx, Code).
 
+%% @doc Evaluate JavaScript code with variable bindings.
+%% Bindings are set as global variables before evaluation.
+%%
+%% Erlang to JavaScript type conversions:
+%% - integers/floats -> numbers
+%% - binaries -> strings
+%% - atoms (true/false/null/undefined) -> JS primitives
+%% - other atoms -> strings
+%% - lists -> arrays (unless it's an iolist, then string)
+%% - maps -> objects
+%% - tuples -> arrays
+%%
+%% Examples:
+%% ```
+%% {ok, 30} = duktape:eval(Ctx, <<"x * y">>, #{<<"x">> => 5, <<"y">> => 6}).
+%% {ok, <<"hello world">>} = duktape:eval(Ctx, <<"greeting + ' ' + name">>,
+%%                                        #{greeting => <<"hello">>, name => <<"world">>}).
+%% '''
+-spec eval(context(), iodata(), bindings()) -> {ok, js_value()} | {error, term()}.
+eval(Ctx, Code, Bindings) when is_map(Bindings) ->
+    nif_eval_bindings(Ctx, Code, Bindings).
+
 %% ============================================================================
 %% Internal NIF stubs
 %% ============================================================================
@@ -100,3 +127,4 @@ nif_info() -> ?nif_stub.
 nif_new_context() -> ?nif_stub.
 nif_destroy_context(_Ctx) -> ?nif_stub.
 nif_eval(_Ctx, _Code) -> ?nif_stub.
+nif_eval_bindings(_Ctx, _Code, _Bindings) -> ?nif_stub.

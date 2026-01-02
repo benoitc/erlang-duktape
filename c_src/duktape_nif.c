@@ -136,6 +136,161 @@ get_context(ErlNifEnv *env, ERL_NIF_TERM term)
 }
 
 /* ============================================================================
+ * Type conversion: Erlang -> Duktape
+ * ============================================================================ */
+
+/* Forward declaration for recursive conversion */
+static int erlang_to_duk(ErlNifEnv *env, duk_context *ctx, ERL_NIF_TERM term);
+
+/*
+ * Push an Erlang term onto the Duktape stack.
+ * Returns 0 on success, -1 on error.
+ */
+static int
+erlang_to_duk(ErlNifEnv *env, duk_context *ctx, ERL_NIF_TERM term)
+{
+    /* Check for atoms first */
+    if (enif_is_atom(env, term)) {
+        char atom_buf[256];
+        if (enif_get_atom(env, term, atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1) <= 0) {
+            return -1;
+        }
+
+        if (strcmp(atom_buf, "true") == 0) {
+            duk_push_boolean(ctx, 1);
+        } else if (strcmp(atom_buf, "false") == 0) {
+            duk_push_boolean(ctx, 0);
+        } else if (strcmp(atom_buf, "null") == 0) {
+            duk_push_null(ctx);
+        } else if (strcmp(atom_buf, "undefined") == 0) {
+            duk_push_undefined(ctx);
+        } else {
+            /* Other atoms become strings */
+            duk_push_string(ctx, atom_buf);
+        }
+        return 0;
+    }
+
+    /* Check for integers */
+    ErlNifSInt64 i64;
+    if (enif_get_int64(env, term, &i64)) {
+        duk_push_number(ctx, (double)i64);
+        return 0;
+    }
+
+    /* Check for doubles */
+    double d;
+    if (enif_get_double(env, term, &d)) {
+        duk_push_number(ctx, d);
+        return 0;
+    }
+
+    /* Check for binaries (become strings) */
+    ErlNifBinary bin;
+    if (enif_inspect_binary(env, term, &bin)) {
+        duk_push_lstring(ctx, (const char *)bin.data, bin.size);
+        return 0;
+    }
+
+    /* Check for lists */
+    if (enif_is_list(env, term)) {
+        /* Could be a string (iolist) or an array */
+        /* Try as iolist first */
+        if (enif_inspect_iolist_as_binary(env, term, &bin)) {
+            duk_push_lstring(ctx, (const char *)bin.data, bin.size);
+            return 0;
+        }
+
+        /* Otherwise treat as array */
+        unsigned int len;
+        if (!enif_get_list_length(env, term, &len)) {
+            return -1;
+        }
+
+        duk_idx_t arr_idx = duk_push_array(ctx);
+        ERL_NIF_TERM head, tail;
+        unsigned int i = 0;
+        tail = term;
+
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            if (erlang_to_duk(env, ctx, head) != 0) {
+                duk_pop(ctx);  /* Pop the array */
+                return -1;
+            }
+            duk_put_prop_index(ctx, arr_idx, i++);
+        }
+        return 0;
+    }
+
+    /* Check for maps (become objects) */
+    if (enif_is_map(env, term)) {
+        duk_push_object(ctx);
+
+        ErlNifMapIterator iter;
+        if (!enif_map_iterator_create(env, term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+            duk_pop(ctx);
+            return -1;
+        }
+
+        ERL_NIF_TERM key, value;
+        while (enif_map_iterator_get_pair(env, &iter, &key, &value)) {
+            /* Get key as string */
+            char key_buf[256];
+            ErlNifBinary key_bin;
+
+            if (enif_get_atom(env, key, key_buf, sizeof(key_buf), ERL_NIF_LATIN1) > 0) {
+                /* Atom key */
+                duk_push_string(ctx, key_buf);
+            } else if (enif_inspect_binary(env, key, &key_bin)) {
+                /* Binary key */
+                duk_push_lstring(ctx, (const char *)key_bin.data, key_bin.size);
+            } else if (enif_inspect_iolist_as_binary(env, key, &key_bin)) {
+                /* Iolist key */
+                duk_push_lstring(ctx, (const char *)key_bin.data, key_bin.size);
+            } else {
+                /* Unsupported key type */
+                enif_map_iterator_destroy(env, &iter);
+                duk_pop(ctx);
+                return -1;
+            }
+
+            /* Convert value */
+            if (erlang_to_duk(env, ctx, value) != 0) {
+                duk_pop_2(ctx);  /* Pop key and object */
+                enif_map_iterator_destroy(env, &iter);
+                return -1;
+            }
+
+            /* Set property */
+            duk_put_prop(ctx, -3);
+
+            enif_map_iterator_next(env, &iter);
+        }
+
+        enif_map_iterator_destroy(env, &iter);
+        return 0;
+    }
+
+    /* Check for tuples - convert to array */
+    int arity;
+    const ERL_NIF_TERM *tuple_elements;
+    if (enif_get_tuple(env, term, &arity, &tuple_elements)) {
+        duk_idx_t arr_idx = duk_push_array(ctx);
+        for (int i = 0; i < arity; i++) {
+            if (erlang_to_duk(env, ctx, tuple_elements[i]) != 0) {
+                duk_pop(ctx);
+                return -1;
+            }
+            duk_put_prop_index(ctx, arr_idx, (duk_uarridx_t)i);
+        }
+        return 0;
+    }
+
+    /* Unsupported type */
+    return -1;
+}
+
+/* ============================================================================
  * Type conversion: Duktape -> Erlang
  * ============================================================================ */
 
@@ -326,6 +481,108 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return enif_make_tuple2(env, atom_ok, result);
 }
 
+/* Evaluate JavaScript code with bindings */
+static ERL_NIF_TERM
+nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+    ErlNifBinary js_code;
+    ERL_NIF_TERM result;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the JavaScript code as binary */
+    if (!enif_inspect_binary(env, argv[1], &js_code)) {
+        if (!enif_inspect_iolist_as_binary(env, argv[1], &js_code)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    }
+
+    /* Bindings must be a map */
+    if (!enif_is_map(env, argv[2])) {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Set bindings as global variables */
+    ErlNifMapIterator iter;
+    if (!enif_map_iterator_create(env, argv[2], &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    ERL_NIF_TERM key, value;
+    while (enif_map_iterator_get_pair(env, &iter, &key, &value)) {
+        /* Get key as string for global variable name */
+        char key_buf[256];
+        ErlNifBinary key_bin;
+        const char *var_name = NULL;
+        size_t var_name_len = 0;
+
+        if (enif_get_atom(env, key, key_buf, sizeof(key_buf), ERL_NIF_LATIN1) > 0) {
+            var_name = key_buf;
+            var_name_len = strlen(key_buf);
+        } else if (enif_inspect_binary(env, key, &key_bin)) {
+            var_name = (const char *)key_bin.data;
+            var_name_len = key_bin.size;
+        } else if (enif_inspect_iolist_as_binary(env, key, &key_bin)) {
+            var_name = (const char *)key_bin.data;
+            var_name_len = key_bin.size;
+        } else {
+            enif_map_iterator_destroy(env, &iter);
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+
+        /* Convert value to Duktape and set as global */
+        if (erlang_to_duk(env, res->ctx, value) != 0) {
+            enif_map_iterator_destroy(env, &iter);
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+
+        /* Set as global variable */
+        duk_put_global_lstring(res->ctx, var_name, var_name_len);
+
+        enif_map_iterator_next(env, &iter);
+    }
+    enif_map_iterator_destroy(env, &iter);
+
+    /* Evaluate the code */
+    duk_push_lstring(res->ctx, (const char *)js_code.data, js_code.size);
+
+    if (duk_peval(res->ctx) != 0) {
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_bin));
+    }
+
+    /* Convert result to Erlang term */
+    result = duk_to_erlang(env, res->ctx, -1);
+    duk_pop(res->ctx);
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
 /* Get NIF information */
 static ERL_NIF_TERM
 nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -398,7 +655,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_info", 0, nif_info, 0},
     {"nif_new_context", 0, nif_new_context, 0},
     {"nif_destroy_context", 1, nif_destroy_context, 0},
-    {"nif_eval", 2, nif_eval, 0}
+    {"nif_eval", 2, nif_eval, 0},
+    {"nif_eval_bindings", 3, nif_eval_bindings, 0}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)
