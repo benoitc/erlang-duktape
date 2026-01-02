@@ -12,6 +12,57 @@
 #include "duktape.h"
 
 /* ============================================================================
+ * Safe memory operations
+ * ============================================================================ */
+
+/*
+ * Safe memory copy with NULL and bounds checking.
+ * Returns 0 on success, -1 on error (NULL pointers or invalid size).
+ * Uses memmove internally which safely handles overlapping regions.
+ */
+static inline int
+safe_memcpy(void *dest, size_t dest_size, const void *src, size_t count)
+{
+    if (dest == NULL || src == NULL) {
+        return -1;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    if (count > dest_size) {
+        return -1;
+    }
+    memmove(dest, src, count);
+    return 0;
+}
+
+/*
+ * Helper to create an Erlang binary from a string with safe copying.
+ * Returns the binary term on success, or a fallback term on failure.
+ */
+static ERL_NIF_TERM
+make_binary_from_string(ErlNifEnv *env, const char *str, size_t len, ERL_NIF_TERM fallback)
+{
+    if (str == NULL) {
+        return fallback;
+    }
+
+    ERL_NIF_TERM bin;
+    unsigned char *buf = enif_make_new_binary(env, len, &bin);
+    if (buf == NULL) {
+        return fallback;
+    }
+
+    if (len > 0) {
+        if (safe_memcpy(buf, len, str, len) != 0) {
+            return fallback;
+        }
+    }
+
+    return bin;
+}
+
+/* ============================================================================
  * Types and structures
  * ============================================================================ */
 
@@ -114,45 +165,31 @@ duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
         case DUK_TYPE_STRING: {
             duk_size_t len;
             const char *str = duk_get_lstring(ctx, idx, &len);
-            ERL_NIF_TERM bin;
-            unsigned char *buf = enif_make_new_binary(env, len, &bin);
-            if (buf) {
-                memcpy(buf, str, len);
-                return bin;
-            }
-            return atom_enomem;
+            return make_binary_from_string(env, str, len, atom_enomem);
         }
 
-        case DUK_TYPE_OBJECT:
+        case DUK_TYPE_OBJECT: {
             /* For now, return a string representation */
             /* Full object conversion will be added in Step 6 */
+            ERL_NIF_TERM result;
             duk_dup(ctx, idx);
-            {
-                const char *str = duk_safe_to_string(ctx, -1);
-                size_t len = strlen(str);
-                ERL_NIF_TERM bin;
-                unsigned char *buf = enif_make_new_binary(env, len, &bin);
-                if (buf) {
-                    memcpy(buf, str, len);
-                }
-                duk_pop(ctx);
-                return buf ? bin : atom_enomem;
-            }
+            const char *str = duk_safe_to_string(ctx, -1);
+            size_t len = str ? strlen(str) : 0;
+            result = make_binary_from_string(env, str, len, atom_enomem);
+            duk_pop(ctx);
+            return result;
+        }
 
-        default:
+        default: {
             /* Unknown type - return string representation */
+            ERL_NIF_TERM result;
             duk_dup(ctx, idx);
-            {
-                const char *str = duk_safe_to_string(ctx, -1);
-                size_t len = strlen(str);
-                ERL_NIF_TERM bin;
-                unsigned char *buf = enif_make_new_binary(env, len, &bin);
-                if (buf) {
-                    memcpy(buf, str, len);
-                }
-                duk_pop(ctx);
-                return buf ? bin : atom_enomem;
-            }
+            const char *str = duk_safe_to_string(ctx, -1);
+            size_t len = str ? strlen(str) : 0;
+            result = make_binary_from_string(env, str, len, atom_enomem);
+            duk_pop(ctx);
+            return result;
+        }
     }
 }
 
@@ -271,17 +308,13 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (duk_peval(res->ctx) != 0) {
         /* Error occurred */
         const char *err_msg = duk_safe_to_string(res->ctx, -1);
-        size_t err_len = strlen(err_msg);
-        ERL_NIF_TERM err_bin;
-        unsigned char *err_buf = enif_make_new_binary(env, err_len, &err_bin);
-        if (err_buf) {
-            memcpy(err_buf, err_msg, err_len);
-        }
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
         duk_pop(res->ctx);  /* Pop error */
         enif_mutex_unlock(res->lock);
 
         return enif_make_tuple2(env, atom_error,
-            enif_make_tuple2(env, atom_js_error, err_buf ? err_bin : atom_enomem));
+            enif_make_tuple2(env, atom_js_error, err_bin));
     }
 
     /* Convert result to Erlang term */
