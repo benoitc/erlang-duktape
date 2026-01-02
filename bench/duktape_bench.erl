@@ -105,6 +105,9 @@ run_all(Opts) ->
         Result
     end, Benchmarks),
 
+    %% Print summary table
+    print_summary(Results),
+
     %% Export results
     export_results(Results, MergedOpts),
     {ok, Results}.
@@ -475,6 +478,29 @@ print_stats(Stats) ->
     io:format("    P99:         ~.3f ms~n", [P99]),
     io:format("    Min:         ~.3f ms~n", [Min]),
     io:format("    Max:         ~.3f ms~n", [Max]),
+    io:format("~n").
+
+print_summary(Results) ->
+    io:format("~n"),
+    io:format("================================================================================~n"),
+    io:format("                           BENCHMARK SUMMARY~n"),
+    io:format("================================================================================~n"),
+    io:format("~n"),
+    io:format("~-30s ~12s ~10s ~10s ~10s~n",
+              ["Benchmark", "Ops/sec", "Mean(ms)", "P95(ms)", "P99(ms)"]),
+    io:format("~s~n", [string:copies("-", 76)]),
+    lists:foreach(fun(Stats) ->
+        #{
+            name := Name,
+            ops_per_sec := OpsPerSec,
+            mean_ms := Mean,
+            p95_ms := P95,
+            p99_ms := P99
+        } = Stats,
+        io:format("~-30s ~12.1f ~10.3f ~10.3f ~10.3f~n",
+                  [Name, OpsPerSec, Mean, P95, P99])
+    end, Results),
+    io:format("~s~n", [string:copies("-", 76)]),
     io:format("~n").
 
 export_results(Results, Opts) ->
