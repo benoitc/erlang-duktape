@@ -294,10 +294,87 @@ erlang_to_duk(ErlNifEnv *env, duk_context *ctx, ERL_NIF_TERM term)
  * Type conversion: Duktape -> Erlang
  * ============================================================================ */
 
-/* Convert a Duktape value at stack index to an Erlang term */
+/* Maximum nesting depth to prevent stack overflow on circular references */
+#define MAX_CONVERSION_DEPTH 100
+
+/* Forward declaration for recursive conversion */
+static ERL_NIF_TERM duk_to_erlang_depth(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx, int depth);
+
+/*
+ * Convert a Duktape array at stack index to an Erlang list.
+ * Returns the list term, or atom_enomem on failure.
+ */
 static ERL_NIF_TERM
-duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
+duk_array_to_erlang_list(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx, int depth)
 {
+    duk_size_t len = duk_get_length(ctx, idx);
+
+    if (len == 0) {
+        return enif_make_list(env, 0);
+    }
+
+    /* Allocate array for list elements */
+    ERL_NIF_TERM *elements = enif_alloc(sizeof(ERL_NIF_TERM) * len);
+    if (elements == NULL) {
+        return atom_enomem;
+    }
+
+    for (duk_size_t i = 0; i < len; i++) {
+        duk_get_prop_index(ctx, idx, (duk_uarridx_t)i);
+        elements[i] = duk_to_erlang_depth(env, ctx, -1, depth + 1);
+        duk_pop(ctx);
+    }
+
+    ERL_NIF_TERM result = enif_make_list_from_array(env, elements, (unsigned int)len);
+    enif_free(elements);
+
+    return result;
+}
+
+/*
+ * Convert a Duktape object at stack index to an Erlang map.
+ * Returns the map term, or atom_enomem on failure.
+ */
+static ERL_NIF_TERM
+duk_object_to_erlang_map(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx, int depth)
+{
+    ERL_NIF_TERM map = enif_make_new_map(env);
+
+    /* Enumerate own properties */
+    duk_enum(ctx, idx, DUK_ENUM_OWN_PROPERTIES_ONLY);
+
+    while (duk_next(ctx, -1, 1)) {  /* key at -2, value at -1 */
+        /* Get key as string */
+        duk_size_t key_len;
+        const char *key_str = duk_get_lstring(ctx, -2, &key_len);
+        ERL_NIF_TERM key = make_binary_from_string(env, key_str, key_len, atom_enomem);
+
+        /* Convert value */
+        ERL_NIF_TERM value = duk_to_erlang_depth(env, ctx, -1, depth + 1);
+
+        /* Add to map */
+        enif_make_map_put(env, map, key, value, &map);
+
+        duk_pop_2(ctx);  /* Pop key and value */
+    }
+
+    duk_pop(ctx);  /* Pop enum object */
+
+    return map;
+}
+
+/*
+ * Convert a Duktape value at stack index to an Erlang term.
+ * Uses depth tracking to prevent stack overflow on circular references.
+ */
+static ERL_NIF_TERM
+duk_to_erlang_depth(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx, int depth)
+{
+    /* Check depth limit */
+    if (depth > MAX_CONVERSION_DEPTH) {
+        return make_binary_from_string(env, "[max depth exceeded]", 20, atom_enomem);
+    }
+
     switch (duk_get_type(ctx, idx)) {
         case DUK_TYPE_UNDEFINED:
             return atom_undefined;
@@ -324,15 +401,24 @@ duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
         }
 
         case DUK_TYPE_OBJECT: {
-            /* For now, return a string representation */
-            /* Full object conversion will be added in Step 6 */
-            ERL_NIF_TERM result;
-            duk_dup(ctx, idx);
-            const char *str = duk_safe_to_string(ctx, -1);
-            size_t len = str ? strlen(str) : 0;
-            result = make_binary_from_string(env, str, len, atom_enomem);
-            duk_pop(ctx);
-            return result;
+            /* Check if it's an array */
+            if (duk_is_array(ctx, idx)) {
+                return duk_array_to_erlang_list(env, ctx, idx, depth);
+            }
+
+            /* Check if it's a function - return string representation */
+            if (duk_is_function(ctx, idx)) {
+                ERL_NIF_TERM result;
+                duk_dup(ctx, idx);
+                const char *str = duk_safe_to_string(ctx, -1);
+                size_t len = str ? strlen(str) : 0;
+                result = make_binary_from_string(env, str, len, atom_enomem);
+                duk_pop(ctx);
+                return result;
+            }
+
+            /* Regular object - convert to map */
+            return duk_object_to_erlang_map(env, ctx, idx, depth);
         }
 
         default: {
@@ -346,6 +432,13 @@ duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
             return result;
         }
     }
+}
+
+/* Public interface - starts with depth 0 */
+static ERL_NIF_TERM
+duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
+{
+    return duk_to_erlang_depth(env, ctx, idx, 0);
 }
 
 /* ============================================================================

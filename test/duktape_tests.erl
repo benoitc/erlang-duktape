@@ -267,3 +267,95 @@ eval_bindings_empty_test() ->
     %% Empty bindings should work
     ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"42">>, #{})),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: JavaScript to Erlang type conversion (arrays and objects)
+%% ============================================================================
+
+eval_return_array_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Simple array
+    ?assertEqual({ok, [1, 2, 3]}, duktape:eval(Ctx, <<"[1, 2, 3]">>)),
+    %% Empty array
+    ?assertEqual({ok, []}, duktape:eval(Ctx, <<"[]">>)),
+    %% Mixed types in array
+    {ok, Result} = duktape:eval(Ctx, <<"[1, 'hello', true, null]">>),
+    ?assertEqual([1, <<"hello">>, true, null], Result),
+    ok = duktape:destroy_context(Ctx).
+
+eval_return_object_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Simple object
+    {ok, Result1} = duktape:eval(Ctx, <<"({x: 1, y: 2})">>),
+    ?assertEqual(#{<<"x">> => 1, <<"y">> => 2}, Result1),
+    %% Empty object
+    ?assertEqual({ok, #{}}, duktape:eval(Ctx, <<"({})">>)),
+    %% Object with string values
+    {ok, Result2} = duktape:eval(Ctx, <<"({name: 'John', city: 'NYC'})">>),
+    ?assertEqual(#{<<"name">> => <<"John">>, <<"city">> => <<"NYC">>}, Result2),
+    ok = duktape:destroy_context(Ctx).
+
+eval_return_nested_array_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Nested arrays
+    ?assertEqual({ok, [[1, 2], [3, 4]]}, duktape:eval(Ctx, <<"[[1, 2], [3, 4]]">>)),
+    %% Deeply nested
+    ?assertEqual({ok, [[[1]]]}, duktape:eval(Ctx, <<"[[[1]]]">>)),
+    ok = duktape:destroy_context(Ctx).
+
+eval_return_nested_object_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Nested objects
+    {ok, Result} = duktape:eval(Ctx, <<"({a: {b: {c: 42}}})">>),
+    ?assertEqual(#{<<"a">> => #{<<"b">> => #{<<"c">> => 42}}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+eval_return_mixed_nested_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Object with array value
+    {ok, Result1} = duktape:eval(Ctx, <<"({items: [1, 2, 3]})">>),
+    ?assertEqual(#{<<"items">> => [1, 2, 3]}, Result1),
+    %% Array with object elements
+    {ok, Result2} = duktape:eval(Ctx, <<"[{x: 1}, {x: 2}]">>),
+    ?assertEqual([#{<<"x">> => 1}, #{<<"x">> => 2}], Result2),
+    ok = duktape:destroy_context(Ctx).
+
+eval_return_function_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Functions return their string representation
+    {ok, Result} = duktape:eval(Ctx, <<"(function add(a, b) { return a + b; })">>),
+    ?assert(is_binary(Result)),
+    ?assertMatch({match, _}, re:run(Result, <<"function">>)),
+    ok = duktape:destroy_context(Ctx).
+
+eval_return_date_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Date objects - should return as object with properties or string
+    {ok, _Result} = duktape:eval(Ctx, <<"new Date(0)">>),
+    %% Just verify it doesn't crash
+    ok = duktape:destroy_context(Ctx).
+
+eval_roundtrip_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Test that data survives a round trip
+    Data = #{<<"users">> => [
+        #{<<"name">> => <<"Alice">>, <<"age">> => 30},
+        #{<<"name">> => <<"Bob">>, <<"age">> => 25}
+    ]},
+    {ok, Result} = duktape:eval(Ctx, <<"data">>, #{<<"data">> => Data}),
+    ?assertEqual(Data, Result),
+    ok = duktape:destroy_context(Ctx).
+
+eval_array_methods_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Test that array methods work and return arrays
+    ?assertEqual({ok, [2, 4, 6]}, duktape:eval(Ctx, <<"[1, 2, 3].map(function(x) { return x * 2; })">>)),
+    ?assertEqual({ok, [2, 3]}, duktape:eval(Ctx, <<"[1, 2, 3].filter(function(x) { return x > 1; })">>)),
+    ok = duktape:destroy_context(Ctx).
+
+eval_json_parse_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% JSON.parse should work
+    {ok, Result} = duktape:eval(Ctx, <<"JSON.parse('{\"a\": 1, \"b\": [2, 3]}')">>),
+    ?assertEqual(#{<<"a">> => 1, <<"b">> => [2, 3]}, Result),
+    ok = duktape:destroy_context(Ctx).
