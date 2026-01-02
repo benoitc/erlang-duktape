@@ -13,7 +13,7 @@ find_package(Erlang REQUIRED)
 # Platform-specific settings
 if(APPLE)
     set(CMAKE_SHARED_MODULE_CREATE_C_FLAGS
-        "${CMAKE_SHARED_MODULE_CREATE_C_FLAGS} -flat_namespace -undefined suppress")
+        "${CMAKE_SHARED_MODULE_CREATE_C_FLAGS} -flat_namespace -undefined dynamic_lookup")
     if(EXISTS "/opt/homebrew")
         # Apple Silicon
         include_directories(/opt/homebrew/include)
@@ -35,7 +35,7 @@ if(MSVC)
 else()
     add_compile_options(-Wall -Wextra)
     # Duktape has some warnings we need to suppress
-    add_compile_options(-Wno-unused-parameter -Wno-pedantic)
+    add_compile_options(-Wno-unused-parameter -Wno-pedantic -Wno-unused-but-set-variable)
 endif()
 
 # Include Erlang headers
