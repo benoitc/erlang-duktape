@@ -25,7 +25,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {duktape, {git, "https://github.com/benoitc/duktape-erlang.git", {branch, "main"}}}
+    {duktape, {git, "https://github.com/benoitc/erlang-duktape.git", {branch, "main"}}}
 ]}.
 ```
 
