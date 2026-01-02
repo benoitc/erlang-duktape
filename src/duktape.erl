@@ -17,7 +17,17 @@
 %% @doc Duktape JavaScript engine for Erlang
 -module(duktape).
 
--export([info/0]).
+%% API
+-export([
+    info/0,
+    new_context/0,
+    destroy_context/1
+]).
+
+%% Types
+-export_type([context/0]).
+
+-opaque context() :: reference().
 
 %% NIF loading
 -compile(no_native).
@@ -47,5 +57,23 @@ on_load() ->
 info() ->
     nif_info().
 
+%% @doc Create a new JavaScript context.
+%% The context will be automatically cleaned up when garbage collected.
+-spec new_context() -> {ok, context()} | {error, term()}.
+new_context() ->
+    nif_new_context().
+
+%% @doc Explicitly destroy a JavaScript context.
+%% This is optional - contexts are automatically cleaned up on GC.
+%% Calling destroy on an already-destroyed context is safe (idempotent).
+-spec destroy_context(context()) -> ok | {error, term()}.
+destroy_context(Ctx) ->
+    nif_destroy_context(Ctx).
+
+%% ============================================================================
 %% Internal NIF stubs
+%% ============================================================================
+
 nif_info() -> ?nif_stub.
+nif_new_context() -> ?nif_stub.
+nif_destroy_context(_Ctx) -> ?nif_stub.
