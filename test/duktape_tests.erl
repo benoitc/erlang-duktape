@@ -359,3 +359,116 @@ eval_json_parse_test() ->
     {ok, Result} = duktape:eval(Ctx, <<"JSON.parse('{\"a\": 1, \"b\": [2, 3]}')">>),
     ?assertEqual(#{<<"a">> => 1, <<"b">> => [2, 3]}, Result),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: call/2 and call/3 - calling JavaScript functions
+%% ============================================================================
+
+call_no_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function getFortyTwo() { return 42; }">>),
+    ?assertEqual({ok, 42}, duktape:call(Ctx, <<"getFortyTwo">>)),
+    ok = duktape:destroy_context(Ctx).
+
+call_simple_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function add(a, b) { return a + b; }">>),
+    ?assertEqual({ok, 7}, duktape:call(Ctx, <<"add">>, [3, 4])),
+    ok = duktape:destroy_context(Ctx).
+
+call_atom_name_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function multiply(a, b) { return a * b; }">>),
+    ?assertEqual({ok, 12}, duktape:call(Ctx, multiply, [3, 4])),
+    ok = duktape:destroy_context(Ctx).
+
+call_string_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function greet(name) { return 'Hello, ' + name + '!'; }">>),
+    ?assertEqual({ok, <<"Hello, World!">>}, duktape:call(Ctx, <<"greet">>, [<<"World">>])),
+    ok = duktape:destroy_context(Ctx).
+
+call_mixed_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function format(name, age) { return name + ' is ' + age + ' years old'; }">>),
+    ?assertEqual({ok, <<"Alice is 30 years old">>},
+                 duktape:call(Ctx, <<"format">>, [<<"Alice">>, 30])),
+    ok = duktape:destroy_context(Ctx).
+
+call_array_arg_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function sum(arr) { return arr.reduce(function(a, b) { return a + b; }, 0); }">>),
+    %% Use integers > 255 to ensure list is treated as array, not iolist
+    ?assertEqual({ok, 1500}, duktape:call(Ctx, <<"sum">>, [[100, 200, 300, 400, 500]])),
+    ok = duktape:destroy_context(Ctx).
+
+call_object_arg_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function getName(obj) { return obj.name; }">>),
+    ?assertEqual({ok, <<"John">>}, duktape:call(Ctx, <<"getName">>, [#{<<"name">> => <<"John">>}])),
+    ok = duktape:destroy_context(Ctx).
+
+call_return_array_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function makeArray(a, b, c) { return [a, b, c]; }">>),
+    ?assertEqual({ok, [1, 2, 3]}, duktape:call(Ctx, <<"makeArray">>, [1, 2, 3])),
+    ok = duktape:destroy_context(Ctx).
+
+call_return_object_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function makeObj(x, y) { return {x: x, y: y}; }">>),
+    ?assertEqual({ok, #{<<"x">> => 1, <<"y">> => 2}}, duktape:call(Ctx, <<"makeObj">>, [1, 2])),
+    ok = duktape:destroy_context(Ctx).
+
+call_builtin_function_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Call built-in Math.max
+    {ok, _} = duktape:eval(Ctx, <<"var myMax = Math.max">>),
+    %% Note: we can't directly call Math.max as it needs 'this' context,
+    %% but we can wrap it
+    {ok, _} = duktape:eval(Ctx, <<"function maxOf(a, b) { return Math.max(a, b); }">>),
+    ?assertEqual({ok, 10}, duktape:call(Ctx, <<"maxOf">>, [5, 10])),
+    ok = duktape:destroy_context(Ctx).
+
+call_function_not_found_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Result = duktape:call(Ctx, <<"nonexistent">>, []),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+call_not_a_function_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"var notFunc = 42">>),
+    Result = duktape:call(Ctx, <<"notFunc">>, []),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+call_destroyed_context_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function test() { return 1; }">>),
+    ok = duktape:destroy_context(Ctx),
+    ?assertMatch({error, invalid_context}, duktape:call(Ctx, <<"test">>, [])).
+
+call_function_throws_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function throwError() { throw new Error('oops'); }">>),
+    Result = duktape:call(Ctx, <<"throwError">>, []),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+call_many_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function sumAll() { var s = 0; for (var i = 0; i < arguments.length; i++) s += arguments[i]; return s; }">>),
+    ?assertEqual({ok, 55}, duktape:call(Ctx, <<"sumAll">>, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
+    ok = duktape:destroy_context(Ctx).
+
+call_closure_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"
+        var counter = 0;
+        function increment() { counter++; return counter; }
+    ">>),
+    ?assertEqual({ok, 1}, duktape:call(Ctx, <<"increment">>, [])),
+    ?assertEqual({ok, 2}, duktape:call(Ctx, <<"increment">>, [])),
+    ?assertEqual({ok, 3}, duktape:call(Ctx, <<"increment">>, [])),
+    ok = duktape:destroy_context(Ctx).

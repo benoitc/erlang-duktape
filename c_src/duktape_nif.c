@@ -676,6 +676,113 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return enif_make_tuple2(env, atom_ok, result);
 }
 
+/* Call a JavaScript function */
+static ERL_NIF_TERM
+nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+    ERL_NIF_TERM result;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the function name */
+    char func_name_buf[256];
+    ErlNifBinary func_name_bin;
+    const char *func_name = NULL;
+    size_t func_name_len = 0;
+
+    if (enif_get_atom(env, argv[1], func_name_buf, sizeof(func_name_buf), ERL_NIF_LATIN1) > 0) {
+        func_name = func_name_buf;
+        func_name_len = strlen(func_name_buf);
+    } else if (enif_inspect_binary(env, argv[1], &func_name_bin)) {
+        func_name = (const char *)func_name_bin.data;
+        func_name_len = func_name_bin.size;
+    } else if (enif_inspect_iolist_as_binary(env, argv[1], &func_name_bin)) {
+        func_name = (const char *)func_name_bin.data;
+        func_name_len = func_name_bin.size;
+    } else {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    /* Get the arguments list */
+    if (!enif_is_list(env, argv[2])) {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    unsigned int args_len;
+    if (!enif_get_list_length(env, argv[2], &args_len)) {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the global function */
+    if (!duk_get_global_lstring(res->ctx, func_name, func_name_len)) {
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+        ERL_NIF_TERM err_msg = make_binary_from_string(env, "function not found", 18, atom_enomem);
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_msg));
+    }
+
+    /* Check if it's actually a function */
+    if (!duk_is_function(res->ctx, -1)) {
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+        ERL_NIF_TERM err_msg = make_binary_from_string(env, "not a function", 14, atom_enomem);
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_msg));
+    }
+
+    /* Push arguments onto the stack */
+    ERL_NIF_TERM args_list = argv[2];
+    ERL_NIF_TERM head, tail;
+    unsigned int pushed_args = 0;
+
+    while (enif_get_list_cell(env, args_list, &head, &tail)) {
+        if (erlang_to_duk(env, res->ctx, head) != 0) {
+            /* Pop function and any pushed arguments */
+            duk_pop_n(res->ctx, (duk_idx_t)(pushed_args + 1));
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+        pushed_args++;
+        args_list = tail;
+    }
+
+    /* Call the function */
+    if (duk_pcall(res->ctx, (duk_idx_t)pushed_args) != 0) {
+        /* Error occurred */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_bin));
+    }
+
+    /* Convert result to Erlang term */
+    result = duk_to_erlang(env, res->ctx, -1);
+    duk_pop(res->ctx);
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
 /* Get NIF information */
 static ERL_NIF_TERM
 nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -749,7 +856,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_new_context", 0, nif_new_context, 0},
     {"nif_destroy_context", 1, nif_destroy_context, 0},
     {"nif_eval", 2, nif_eval, 0},
-    {"nif_eval_bindings", 3, nif_eval_bindings, 0}
+    {"nif_eval_bindings", 3, nif_eval_bindings, 0},
+    {"nif_call", 3, nif_call, 0}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)

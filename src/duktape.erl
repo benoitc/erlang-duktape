@@ -23,7 +23,9 @@
     new_context/0,
     destroy_context/1,
     eval/2,
-    eval/3
+    eval/3,
+    call/2,
+    call/3
 ]).
 
 %% Types
@@ -119,6 +121,31 @@ eval(Ctx, Code) ->
 eval(Ctx, Code, Bindings) when is_map(Bindings) ->
     nif_eval_bindings(Ctx, Code, Bindings).
 
+%% @doc Call a global JavaScript function with no arguments.
+%% Equivalent to call(Ctx, FunctionName, []).
+%%
+%% Examples:
+%% ```
+%% {ok, _} = duktape:eval(Ctx, <<"function getTime() { return Date.now(); }">>).
+%% {ok, Timestamp} = duktape:call(Ctx, <<"getTime">>).
+%% '''
+-spec call(context(), iodata() | atom()) -> {ok, js_value()} | {error, term()}.
+call(Ctx, FunctionName) ->
+    call(Ctx, FunctionName, []).
+
+%% @doc Call a global JavaScript function with arguments.
+%% The function must exist in the global scope.
+%%
+%% Examples:
+%% ```
+%% {ok, _} = duktape:eval(Ctx, <<"function add(a, b) { return a + b; }">>).
+%% {ok, 7} = duktape:call(Ctx, <<"add">>, [3, 4]).
+%% {ok, 7} = duktape:call(Ctx, add, [3, 4]).
+%% '''
+-spec call(context(), iodata() | atom(), [term()]) -> {ok, js_value()} | {error, term()}.
+call(Ctx, FunctionName, Args) when is_list(Args) ->
+    nif_call(Ctx, FunctionName, Args).
+
 %% ============================================================================
 %% Internal NIF stubs
 %% ============================================================================
@@ -128,3 +155,4 @@ nif_new_context() -> ?nif_stub.
 nif_destroy_context(_Ctx) -> ?nif_stub.
 nif_eval(_Ctx, _Code) -> ?nif_stub.
 nif_eval_bindings(_Ctx, _Code, _Bindings) -> ?nif_stub.
+nif_call(_Ctx, _FunctionName, _Args) -> ?nif_stub.
