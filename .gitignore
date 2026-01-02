@@ -28,3 +28,4 @@ doc/
 # OS
 .DS_Store
 Thumbs.db
+erl_crash.dump
