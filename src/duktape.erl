@@ -14,8 +14,8 @@
 %%% See the License for the specific language governing permissions and
 %%% limitations under the License.
 
-%% @doc Ducktape - Duktape JavaScript engine for Erlang
--module(ducktape).
+%% @doc Duktape JavaScript engine for Erlang
+-module(duktape).
 
 -export([info/0]).
 
@@ -33,14 +33,14 @@ on_load() ->
         {error, bad_name} ->
             case code:which(?MODULE) of
                 Filename when is_list(Filename) ->
-                    filename:join([filename:dirname(Filename), "../priv", "ducktape"]);
+                    filename:join([filename:dirname(Filename), "../priv", "duktape"]);
                 _ ->
-                    filename:join("../priv", "ducktape")
+                    filename:join("../priv", "duktape")
             end;
         Dir ->
-            filename:join(Dir, "ducktape")
+            filename:join(Dir, "duktape")
     end,
-    erlang:load_nif(SoName, application:get_all_env(ducktape)).
+    erlang:load_nif(SoName, application:get_all_env(duktape)).
 
 %% @doc Get NIF information. Used to verify NIF is loaded correctly.
 -spec info() -> {ok, string()}.

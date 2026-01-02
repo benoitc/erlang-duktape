@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(ducktape_nif C)
+project(duktape_nif C)
 
 # Output directory
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/../priv)
@@ -33,37 +33,38 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 if(MSVC)
     add_compile_options(/W3)
 else()
-    add_compile_options(-Wall -Wextra -pedantic)
-    # Duktape may have some warnings we need to suppress
-    add_compile_options(-Wno-unused-parameter)
+    add_compile_options(-Wall -Wextra)
+    # Duktape has some warnings we need to suppress
+    add_compile_options(-Wno-unused-parameter -Wno-pedantic)
 endif()
 
 # Include Erlang headers
 include_directories(${ERLANG_EI_INCLUDE_PATH})
 include_directories(${ERLANG_ERTS_INCLUDE_PATH})
 
+# Include Duktape headers
+include_directories(${CMAKE_SOURCE_DIR}/duktape)
+
 # Library paths
 link_directories(${ERLANG_EI_LIBRARY_PATH})
 
-# Duktape source (will be added in step 2)
-# For now, create a stub NIF
-
 # Source files
-set(DUCKTAPE_NIF_SRC
-    ducktape_nif.c
+set(DUKTAPE_NIF_SRC
+    duktape_nif.c
+    duktape/duktape.c
 )
 
 # Create the shared library
-add_library(ducktape MODULE ${DUCKTAPE_NIF_SRC})
+add_library(duktape MODULE ${DUKTAPE_NIF_SRC})
 
 # Set output name without 'lib' prefix on some platforms
-set_target_properties(ducktape PROPERTIES PREFIX "")
+set_target_properties(duktape PROPERTIES PREFIX "")
 
 # Link libraries
 if(WIN32)
-    target_link_libraries(ducktape ei)
+    target_link_libraries(duktape ei)
 elseif(APPLE)
     # macOS doesn't need explicit linking for NIF
 else()
-    target_link_libraries(ducktape ei pthread)
+    target_link_libraries(duktape ei pthread m)
 endif()

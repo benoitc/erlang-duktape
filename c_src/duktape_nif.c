@@ -1,5 +1,5 @@
 /*
- * Ducktape Erlang NIF - JavaScript engine for Erlang
+ * Duktape Erlang NIF - JavaScript engine for Erlang
  *
  * Copyright (c) 2025 Benoit Chesneau
  * Licensed under the Apache License, Version 2.0
@@ -7,6 +7,7 @@
 
 #include <string.h>
 #include "erl_nif.h"
+#include "duktape.h"
 
 /* Atoms */
 static ERL_NIF_TERM atom_ok;
@@ -22,6 +23,12 @@ on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     /* Initialize atoms */
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
+
+    /* Test Duktape initialization */
+    duk_context *ctx = duk_create_heap_default();
+    if (ctx) {
+        duk_destroy_heap(ctx);
+    }
 
     return 0;
 }
@@ -51,7 +58,7 @@ nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     (void)argv;
 
     return enif_make_tuple2(env, atom_ok,
-        enif_make_string(env, "ducktape nif loaded", ERL_NIF_LATIN1));
+        enif_make_string(env, "duktape nif loaded", ERL_NIF_LATIN1));
 }
 
 /* NIF function table */
@@ -59,4 +66,4 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_info", 0, nif_info, 0}
 };
 
-ERL_NIF_INIT(ducktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)
+ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)
