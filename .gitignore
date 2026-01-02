@@ -1,0 +1,27 @@
+# Build artifacts
+_build/
+ebin/
+*.beam
+*.o
+*.so
+*.dylib
+*.dll
+
+# NIF output (will be rebuilt)
+priv/*.so
+priv/*.dylib
+priv/*.dll
+
+# Rebar3
+rebar.lock
+.rebar3/
+
+# Editor
+*~
+*.swp
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
