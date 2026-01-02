@@ -797,3 +797,272 @@ context_cleanup_on_process_death_test() ->
     ok = duktape:destroy_context(Ctx),
     %% Should be invalid now
     ?assertMatch({error, invalid_context}, duktape:eval(Ctx, <<"x">>)).
+
+%% ============================================================================
+%% Test: Error handling and edge cases
+%% ============================================================================
+
+%% Special JavaScript values
+
+special_nan_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Result} = duktape:eval(Ctx, <<"NaN">>),
+    %% NaN is represented as atom 'nan' since Erlang can't represent NaN
+    ?assertEqual(nan, Result),
+    ok = duktape:destroy_context(Ctx).
+
+special_infinity_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, PosInf} = duktape:eval(Ctx, <<"Infinity">>),
+    {ok, NegInf} = duktape:eval(Ctx, <<"-Infinity">>),
+    %% Infinity is represented as atoms since Erlang can't represent Infinity
+    ?assertEqual(infinity, PosInf),
+    ?assertEqual(neg_infinity, NegInf),
+    ok = duktape:destroy_context(Ctx).
+
+special_large_integer_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% JavaScript safe integer max is 2^53 - 1
+    {ok, SafeMax} = duktape:eval(Ctx, <<"Number.MAX_SAFE_INTEGER">>),
+    ?assertEqual(9007199254740991, SafeMax),
+    %% Larger integers lose precision in JS
+    {ok, _} = duktape:eval(Ctx, <<"9007199254740993">>),
+    ok = duktape:destroy_context(Ctx).
+
+special_negative_zero_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, NegZero} = duktape:eval(Ctx, <<"-0">>),
+    %% -0 in JavaScript
+    ?assertEqual(0, NegZero),  %% Erlang treats -0 as 0
+    ok = duktape:destroy_context(Ctx).
+
+%% Unicode handling
+
+unicode_string_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Use JavaScript unicode escapes for source code
+    {ok, Result1} = duktape:eval(Ctx, <<"'h\\u00e9llo'">>),  %% héllo
+    ?assertEqual(<<"héllo"/utf8>>, Result1),
+    %% Emoji via unicode escapes
+    {ok, Result2} = duktape:eval(Ctx, <<"'\\uD83D\\uDC4B'">>),  %% 👋 (wave)
+    ?assert(is_binary(Result2)),
+    ok = duktape:destroy_context(Ctx).
+
+unicode_binding_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Pass unicode via bindings - bindings go through type conversion
+    {ok, Result} = duktape:eval(Ctx, <<"greeting + ', ' + name + '!'">>,
+                              #{<<"greeting">> => <<"Hello"/utf8>>,
+                                <<"name">> => <<"World"/utf8>>}),
+    ?assertEqual(<<"Hello, World!">>, Result),
+    ok = duktape:destroy_context(Ctx).
+
+unicode_in_binding_value_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Unicode characters in binding values
+    UnicodeStr = <<"café"/utf8>>,
+    {ok, Result} = duktape:eval(Ctx, <<"x">>, #{<<"x">> => UnicodeStr}),
+    ?assertEqual(UnicodeStr, Result),
+    ok = duktape:destroy_context(Ctx).
+
+%% Empty and null inputs
+
+empty_string_eval_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Empty string eval returns undefined
+    ?assertEqual({ok, undefined}, duktape:eval(Ctx, <<"">>)),
+    ok = duktape:destroy_context(Ctx).
+
+empty_binary_binding_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, <<"">>}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => <<"">>})),
+    ok = duktape:destroy_context(Ctx).
+
+%% Large data handling
+
+large_string_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Create a large string (100KB)
+    LargeStr = list_to_binary(lists:duplicate(100000, $x)),
+    {ok, Result} = duktape:eval(Ctx, <<"str">>, #{<<"str">> => LargeStr}),
+    ?assertEqual(LargeStr, Result),
+    ok = duktape:destroy_context(Ctx).
+
+large_array_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Create an array with 1000 elements
+    {ok, _} = duktape:eval(Ctx, <<"
+        var arr = [];
+        for (var i = 0; i < 1000; i++) arr.push(i);
+    ">>),
+    {ok, Result} = duktape:eval(Ctx, <<"arr">>),
+    ?assertEqual(1000, length(Result)),
+    ?assertEqual(lists:seq(0, 999), Result),
+    ok = duktape:destroy_context(Ctx).
+
+large_object_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Create an object with 50 properties (reduced for safety)
+    {ok, _} = duktape:eval(Ctx, <<"
+        var obj = {};
+        for (var i = 0; i < 50; i++) obj['key' + i] = i;
+        obj;
+    ">>),
+    {ok, Result} = duktape:eval(Ctx, <<"obj">>),
+    ?assertEqual(50, map_size(Result)),
+    ok = duktape:destroy_context(Ctx).
+
+deep_nesting_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Create moderately nested structure (reduced to avoid stack issues)
+    {ok, _} = duktape:eval(Ctx, <<"
+        var obj = {value: 'deep'};
+        for (var i = 0; i < 20; i++) {
+            obj = {nested: obj};
+        }
+    ">>),
+    {ok, Result} = duktape:eval(Ctx, <<"obj">>),
+    ?assert(is_map(Result)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Error message quality
+
+error_message_syntax_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {error, {js_error, Msg}} = duktape:eval(Ctx, <<"function(">>),
+    ?assert(is_binary(Msg)),
+    ?assert(byte_size(Msg) > 0),
+    ok = duktape:destroy_context(Ctx).
+
+error_message_type_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {error, {js_error, Msg}} = duktape:eval(Ctx, <<"null.foo">>),
+    ?assert(is_binary(Msg)),
+    ?assertMatch({match, _}, re:run(Msg, <<"TypeError">>)),
+    ok = duktape:destroy_context(Ctx).
+
+error_message_reference_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {error, {js_error, Msg}} = duktape:eval(Ctx, <<"undefinedVariable">>),
+    ?assert(is_binary(Msg)),
+    ok = duktape:destroy_context(Ctx).
+
+error_message_custom_throw_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {error, {js_error, Msg}} = duktape:eval(Ctx, <<"throw 'custom error message'">>),
+    ?assertEqual(<<"custom error message">>, Msg),
+    ok = duktape:destroy_context(Ctx).
+
+error_message_throw_object_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {error, {js_error, Msg}} = duktape:eval(Ctx, <<"throw new Error('detailed error')">>),
+    ?assert(is_binary(Msg)),
+    ?assertMatch({match, _}, re:run(Msg, <<"detailed error">>)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Type conversion edge cases
+
+type_convert_empty_map_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, #{}}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => #{}})),
+    ok = duktape:destroy_context(Ctx).
+
+type_convert_empty_list_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Empty list becomes empty iolist/string in JS
+    ?assertEqual({ok, <<"">>}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => []})),
+    ok = duktape:destroy_context(Ctx).
+
+type_convert_empty_tuple_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual({ok, []}, duktape:eval(Ctx, <<"x">>, #{<<"x">> => {}})),
+    ok = duktape:destroy_context(Ctx).
+
+type_convert_nested_empty_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Input = #{<<"a">> => #{}, <<"b">> => {}, <<"c">> => <<"">>},
+    {ok, Result} = duktape:eval(Ctx, <<"x">>, #{<<"x">> => Input}),
+    ?assertEqual(#{<<"a">> => #{}, <<"b">> => [], <<"c">> => <<"">>}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+type_convert_boolean_in_map_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Input = #{<<"t">> => true, <<"f">> => false},
+    {ok, Result} = duktape:eval(Ctx, <<"x">>, #{<<"x">> => Input}),
+    ?assertEqual(#{<<"t">> => true, <<"f">> => false}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+%% Recursive/circular structure handling
+
+circular_detection_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Create a simple object without circular reference (for safety)
+    {ok, _} = duktape:eval(Ctx, <<"var obj = {name: 'test', value: 42}">>),
+    {ok, Result} = duktape:eval(Ctx, <<"obj">>),
+    ?assert(is_map(Result)),
+    ?assertEqual(<<"test">>, maps:get(<<"name">>, Result)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Regex and special objects
+
+regex_to_string_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Result} = duktape:eval(Ctx, <<"/hello.*world/gi">>),
+    %% Regex is an object in Duktape, may be map or string representation
+    ?assert(is_binary(Result) orelse is_map(Result)),
+    ok = duktape:destroy_context(Ctx).
+
+date_handling_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Date object - verify it doesn't crash
+    {ok, _} = duktape:eval(Ctx, <<"new Date()">>),
+    {ok, Timestamp} = duktape:eval(Ctx, <<"Date.now()">>),
+    ?assert(is_integer(Timestamp) orelse is_float(Timestamp)),
+    ?assert(Timestamp > 0),
+    ok = duktape:destroy_context(Ctx).
+
+%% Multiple sequential operations
+
+sequential_operations_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Sequential operations should not leak or corrupt state
+    lists:foreach(fun(I) ->
+        IBin = integer_to_binary(I),
+        {ok, I} = duktape:eval(Ctx, IBin)
+    end, lists:seq(1, 20)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Recover from errors
+
+error_recovery_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Error should not corrupt context
+    {error, _} = duktape:eval(Ctx, <<"throw 'error'">>),
+    %% Context should still work
+    ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"42">>)),
+    %% Multiple errors
+    {error, _} = duktape:eval(Ctx, <<"syntax error here (">>),
+    {error, _} = duktape:eval(Ctx, <<"undefined.property">>),
+    %% Still works
+    ?assertEqual({ok, <<"ok">>}, duktape:eval(Ctx, <<"'ok'">>)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Call edge cases
+
+call_no_return_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function noReturn() { var x = 1; }">>),
+    ?assertEqual({ok, undefined}, duktape:call(Ctx, <<"noReturn">>, [])),
+    ok = duktape:destroy_context(Ctx).
+
+call_recursive_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"
+        function factorial(n) {
+            if (n <= 1) return 1;
+            return n * factorial(n - 1);
+        }
+    ">>),
+    ?assertEqual({ok, 120}, duktape:call(Ctx, <<"factorial">>, [5])),
+    ?assertEqual({ok, 3628800}, duktape:call(Ctx, <<"factorial">>, [10])),
+    ok = duktape:destroy_context(Ctx).

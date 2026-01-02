@@ -388,6 +388,17 @@ duk_to_erlang_depth(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx, int depth)
 
         case DUK_TYPE_NUMBER: {
             double num = duk_get_number(ctx, idx);
+            /* Handle special values that Erlang can't represent as floats */
+            if (isnan(num)) {
+                return enif_make_atom(env, "nan");
+            }
+            if (isinf(num)) {
+                if (num > 0) {
+                    return enif_make_atom(env, "infinity");
+                } else {
+                    return enif_make_atom(env, "neg_infinity");
+                }
+            }
             /* Check if it's an integer */
             if (floor(num) == num && num >= INT64_MIN && num <= INT64_MAX) {
                 return enif_make_int64(env, (int64_t)num);
