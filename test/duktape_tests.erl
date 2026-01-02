@@ -472,3 +472,109 @@ call_closure_test() ->
     ?assertEqual({ok, 2}, duktape:call(Ctx, <<"increment">>, [])),
     ?assertEqual({ok, 3}, duktape:call(Ctx, <<"increment">>, [])),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: CommonJS module support
+%% ============================================================================
+
+module_register_require_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Register a simple module
+    ok = duktape:register_module(Ctx, <<"math">>,
+        <<"exports.add = function(a, b) { return a + b; };">>),
+    %% Require it and get exports
+    {ok, Exports} = duktape:require(Ctx, <<"math">>),
+    ?assert(is_map(Exports)),
+    ok = duktape:destroy_context(Ctx).
+
+module_use_from_js_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_module(Ctx, <<"utils">>,
+        <<"exports.greet = function(name) { return 'Hello, ' + name + '!'; };">>),
+    %% Use require() from JavaScript
+    {ok, Result} = duktape:eval(Ctx, <<"require('utils').greet('World')">>),
+    ?assertEqual(<<"Hello, World!">>, Result),
+    ok = duktape:destroy_context(Ctx).
+
+module_atom_id_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Register with atom module ID
+    ok = duktape:register_module(Ctx, mymodule,
+        <<"exports.value = 42;">>),
+    {ok, Exports} = duktape:require(Ctx, mymodule),
+    ?assertEqual(#{<<"value">> => 42}, Exports),
+    ok = duktape:destroy_context(Ctx).
+
+module_multiple_exports_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_module(Ctx, <<"calc">>, <<"
+        exports.add = function(a, b) { return a + b; };
+        exports.sub = function(a, b) { return a - b; };
+        exports.mul = function(a, b) { return a * b; };
+        exports.PI = 3.14159;
+    ">>),
+    {ok, _} = duktape:require(Ctx, <<"calc">>),
+    ?assertEqual({ok, 7}, duktape:eval(Ctx, <<"require('calc').add(3, 4)">>)),
+    ?assertEqual({ok, 3}, duktape:eval(Ctx, <<"require('calc').sub(7, 4)">>)),
+    ?assertEqual({ok, 12}, duktape:eval(Ctx, <<"require('calc').mul(3, 4)">>)),
+    ok = duktape:destroy_context(Ctx).
+
+module_caching_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Register a module with a counter
+    ok = duktape:register_module(Ctx, <<"counter">>, <<"
+        var count = 0;
+        exports.increment = function() { count++; return count; };
+    ">>),
+    %% First require
+    {ok, _} = duktape:require(Ctx, <<"counter">>),
+    ?assertEqual({ok, 1}, duktape:eval(Ctx, <<"require('counter').increment()">>)),
+    ?assertEqual({ok, 2}, duktape:eval(Ctx, <<"require('counter').increment()">>)),
+    %% Require again - should get the same (cached) module
+    {ok, _} = duktape:require(Ctx, <<"counter">>),
+    ?assertEqual({ok, 3}, duktape:eval(Ctx, <<"require('counter').increment()">>)),
+    ok = duktape:destroy_context(Ctx).
+
+module_dependency_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Register base module
+    ok = duktape:register_module(Ctx, <<"base">>,
+        <<"exports.value = 10;">>),
+    %% Register module that depends on base
+    ok = duktape:register_module(Ctx, <<"derived">>, <<"
+        var base = require('base');
+        exports.doubled = base.value * 2;
+    ">>),
+    {ok, Exports} = duktape:require(Ctx, <<"derived">>),
+    ?assertEqual(#{<<"doubled">> => 20}, Exports),
+    ok = duktape:destroy_context(Ctx).
+
+module_not_found_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Result = duktape:require(Ctx, <<"nonexistent">>),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+module_syntax_error_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_module(Ctx, <<"bad">>, <<"exports.x = {">>),
+    Result = duktape:require(Ctx, <<"bad">>),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+module_exports_replacement_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Test replacing module.exports entirely
+    ok = duktape:register_module(Ctx, <<"singleton">>, <<"
+        module.exports = function() { return 'I am a function!'; };
+    ">>),
+    {ok, _} = duktape:require(Ctx, <<"singleton">>),
+    {ok, Result} = duktape:eval(Ctx, <<"require('singleton')()">>),
+    ?assertEqual(<<"I am a function!">>, Result),
+    ok = duktape:destroy_context(Ctx).
+
+module_destroyed_context_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:destroy_context(Ctx),
+    ?assertMatch({error, invalid_context}, duktape:register_module(Ctx, <<"test">>, <<"exports.x = 1;">>)),
+    ?assertMatch({error, invalid_context}, duktape:require(Ctx, <<"test">>)).

@@ -10,6 +10,7 @@
 #include <math.h>
 #include "erl_nif.h"
 #include "duktape.h"
+#include "duk_module_duktape.h"
 
 /* ============================================================================
  * Safe memory operations
@@ -442,6 +443,44 @@ duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
 }
 
 /* ============================================================================
+ * CommonJS module support
+ * ============================================================================ */
+
+/* Key used to store registered modules in the global stash */
+#define MODULE_STASH_KEY "\xff" "erlang_modules"
+
+/*
+ * Duktape.modSearch callback - looks up modules from the stash.
+ * Called as: modSearch(resolved_id, require, exports, module)
+ * Should return module source code as string, or undefined if module
+ * was populated directly into exports.
+ */
+static duk_ret_t
+mod_search(duk_context *ctx)
+{
+    /* Get resolved module ID */
+    const char *mod_id = duk_require_string(ctx, 0);
+
+    /* Look up in global stash */
+    duk_push_global_stash(ctx);
+    if (!duk_get_prop_string(ctx, -1, MODULE_STASH_KEY)) {
+        /* No modules registered */
+        duk_pop_2(ctx);
+        return duk_type_error(ctx, "module not found: %s", mod_id);
+    }
+
+    /* Get module source from stash */
+    if (!duk_get_prop_string(ctx, -1, mod_id)) {
+        /* Module not found */
+        duk_pop_3(ctx);
+        return duk_type_error(ctx, "module not found: %s", mod_id);
+    }
+
+    /* Return the source code (string on top of stack) */
+    return 1;
+}
+
+/* ============================================================================
  * NIF functions
  * ============================================================================ */
 
@@ -479,6 +518,21 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         enif_release_resource(res);
         return enif_make_tuple2(env, atom_error, atom_enomem);
     }
+
+    /* Initialize CommonJS module system */
+    duk_module_duktape_init(res->ctx);
+
+    /* Set up the modSearch callback */
+    duk_get_global_string(res->ctx, "Duktape");
+    duk_push_c_function(res->ctx, mod_search, 4 /*nargs*/);
+    duk_put_prop_string(res->ctx, -2, "modSearch");
+    duk_pop(res->ctx);
+
+    /* Initialize the module stash */
+    duk_push_global_stash(res->ctx);
+    duk_push_object(res->ctx);
+    duk_put_prop_string(res->ctx, -2, MODULE_STASH_KEY);
+    duk_pop(res->ctx);
 
     /* Create the resource term */
     ERL_NIF_TERM res_term = enif_make_resource(env, res);
@@ -783,6 +837,130 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return enif_make_tuple2(env, atom_ok, result);
 }
 
+/* Register a CommonJS module */
+static ERL_NIF_TERM
+nif_register_module(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    duktape_ctx_t *res;
+    ErlNifBinary mod_id_bin;
+    ErlNifBinary source_bin;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the module ID */
+    char mod_id_buf[256];
+    const char *mod_id = NULL;
+    size_t mod_id_len = 0;
+
+    if (enif_get_atom(env, argv[1], mod_id_buf, sizeof(mod_id_buf), ERL_NIF_LATIN1) > 0) {
+        mod_id = mod_id_buf;
+        mod_id_len = strlen(mod_id_buf);
+    } else if (enif_inspect_binary(env, argv[1], &mod_id_bin)) {
+        mod_id = (const char *)mod_id_bin.data;
+        mod_id_len = mod_id_bin.size;
+    } else if (enif_inspect_iolist_as_binary(env, argv[1], &mod_id_bin)) {
+        mod_id = (const char *)mod_id_bin.data;
+        mod_id_len = mod_id_bin.size;
+    } else {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    /* Get the module source code */
+    if (!enif_inspect_binary(env, argv[2], &source_bin)) {
+        if (!enif_inspect_iolist_as_binary(env, argv[2], &source_bin)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Store module in the stash */
+    duk_push_global_stash(res->ctx);
+    duk_get_prop_string(res->ctx, -1, MODULE_STASH_KEY);
+    duk_push_lstring(res->ctx, (const char *)source_bin.data, source_bin.size);
+    duk_put_prop_lstring(res->ctx, -2, mod_id, mod_id_len);
+    duk_pop_2(res->ctx);
+
+    enif_mutex_unlock(res->lock);
+
+    return atom_ok;
+}
+
+/* Require a CommonJS module */
+static ERL_NIF_TERM
+nif_require(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    duktape_ctx_t *res;
+    ErlNifBinary mod_id_bin;
+    ERL_NIF_TERM result;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the module ID */
+    char mod_id_buf[256];
+    const char *mod_id = NULL;
+    size_t mod_id_len = 0;
+
+    if (enif_get_atom(env, argv[1], mod_id_buf, sizeof(mod_id_buf), ERL_NIF_LATIN1) > 0) {
+        mod_id = mod_id_buf;
+        mod_id_len = strlen(mod_id_buf);
+    } else if (enif_inspect_binary(env, argv[1], &mod_id_bin)) {
+        mod_id = (const char *)mod_id_bin.data;
+        mod_id_len = mod_id_bin.size;
+    } else if (enif_inspect_iolist_as_binary(env, argv[1], &mod_id_bin)) {
+        mod_id = (const char *)mod_id_bin.data;
+        mod_id_len = mod_id_bin.size;
+    } else {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Call require(mod_id) */
+    duk_get_global_string(res->ctx, "require");
+    duk_push_lstring(res->ctx, mod_id, mod_id_len);
+
+    if (duk_pcall(res->ctx, 1) != 0) {
+        /* Error occurred */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_bin));
+    }
+
+    /* Convert result (module.exports) to Erlang term */
+    result = duk_to_erlang(env, res->ctx, -1);
+    duk_pop(res->ctx);
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
 /* Get NIF information */
 static ERL_NIF_TERM
 nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -857,7 +1035,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_destroy_context", 1, nif_destroy_context, 0},
     {"nif_eval", 2, nif_eval, 0},
     {"nif_eval_bindings", 3, nif_eval_bindings, 0},
-    {"nif_call", 3, nif_call, 0}
+    {"nif_call", 3, nif_call, 0},
+    {"nif_register_module", 3, nif_register_module, 0},
+    {"nif_require", 2, nif_require, 0}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)

@@ -25,7 +25,9 @@
     eval/2,
     eval/3,
     call/2,
-    call/3
+    call/3,
+    register_module/3,
+    require/2
 ]).
 
 %% Types
@@ -146,6 +148,32 @@ call(Ctx, FunctionName) ->
 call(Ctx, FunctionName, Args) when is_list(Args) ->
     nif_call(Ctx, FunctionName, Args).
 
+%% @doc Register a CommonJS module with source code.
+%% The module can then be loaded with require/2 or via require() in JavaScript.
+%%
+%% Examples:
+%% ```
+%% ok = duktape:register_module(Ctx, <<"math">>, <<"exports.add = function(a, b) { return a + b; };">>).
+%% {ok, Exports} = duktape:require(Ctx, <<"math">>).
+%% '''
+-spec register_module(context(), iodata() | atom(), iodata()) -> ok | {error, term()}.
+register_module(Ctx, ModuleId, Source) ->
+    nif_register_module(Ctx, ModuleId, Source).
+
+%% @doc Load a CommonJS module and return its exports.
+%% The module must have been registered with register_module/3.
+%% Modules are cached - subsequent requires return the same exports object.
+%%
+%% Examples:
+%% ```
+%% ok = duktape:register_module(Ctx, <<"utils">>, <<"exports.greet = function(n) { return 'Hello, ' + n; };">>).
+%% {ok, _} = duktape:require(Ctx, <<"utils">>).
+%% {ok, <<"Hello, World">>} = duktape:eval(Ctx, <<"require('utils').greet('World')">>).
+%% '''
+-spec require(context(), iodata() | atom()) -> {ok, js_value()} | {error, term()}.
+require(Ctx, ModuleId) ->
+    nif_require(Ctx, ModuleId).
+
 %% ============================================================================
 %% Internal NIF stubs
 %% ============================================================================
@@ -156,3 +184,5 @@ nif_destroy_context(_Ctx) -> ?nif_stub.
 nif_eval(_Ctx, _Code) -> ?nif_stub.
 nif_eval_bindings(_Ctx, _Code, _Bindings) -> ?nif_stub.
 nif_call(_Ctx, _FunctionName, _Args) -> ?nif_stub.
+nif_register_module(_Ctx, _ModuleId, _Source) -> ?nif_stub.
+nif_require(_Ctx, _ModuleId) -> ?nif_stub.

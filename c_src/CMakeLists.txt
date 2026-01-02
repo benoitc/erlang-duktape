@@ -52,6 +52,7 @@ link_directories(${ERLANG_EI_LIBRARY_PATH})
 set(DUKTAPE_NIF_SRC
     duktape_nif.c
     duktape/duktape.c
+    duktape/duk_module_duktape.c
 )
 
 # Create the shared library
