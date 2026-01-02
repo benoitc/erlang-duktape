@@ -237,4 +237,4 @@ Run benchmarks yourself:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-Duktape is also licensed under the MIT License - see [c_src/duktape/LICENSE.txt](c_src/duktape/LICENSE.txt).
+Duktape is also licensed under the MIT License.
