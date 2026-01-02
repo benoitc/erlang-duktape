@@ -578,3 +578,222 @@ module_destroyed_context_test() ->
     ok = duktape:destroy_context(Ctx),
     ?assertMatch({error, invalid_context}, duktape:register_module(Ctx, <<"test">>, <<"exports.x = 1;">>)),
     ?assertMatch({error, invalid_context}, duktape:require(Ctx, <<"test">>)).
+
+%% ============================================================================
+%% Test: Multiple contexts and isolation
+%% ============================================================================
+
+isolation_functions_test() ->
+    {ok, Ctx1} = duktape:new_context(),
+    {ok, Ctx2} = duktape:new_context(),
+    %% Define function in Ctx1
+    {ok, _} = duktape:eval(Ctx1, <<"function myFunc() { return 'from ctx1'; }">>),
+    ?assertEqual({ok, <<"from ctx1">>}, duktape:call(Ctx1, <<"myFunc">>, [])),
+    %% Function should not exist in Ctx2
+    ?assertMatch({error, {js_error, _}}, duktape:call(Ctx2, <<"myFunc">>, [])),
+    %% Define different function in Ctx2
+    {ok, _} = duktape:eval(Ctx2, <<"function myFunc() { return 'from ctx2'; }">>),
+    ?assertEqual({ok, <<"from ctx2">>}, duktape:call(Ctx2, <<"myFunc">>, [])),
+    %% Ctx1 should still have its own function
+    ?assertEqual({ok, <<"from ctx1">>}, duktape:call(Ctx1, <<"myFunc">>, [])),
+    ok = duktape:destroy_context(Ctx1),
+    ok = duktape:destroy_context(Ctx2).
+
+isolation_modules_test() ->
+    {ok, Ctx1} = duktape:new_context(),
+    {ok, Ctx2} = duktape:new_context(),
+    %% Register module in Ctx1
+    ok = duktape:register_module(Ctx1, <<"mymod">>, <<"exports.value = 'ctx1';">>),
+    {ok, _} = duktape:require(Ctx1, <<"mymod">>),
+    ?assertEqual({ok, <<"ctx1">>}, duktape:eval(Ctx1, <<"require('mymod').value">>)),
+    %% Module should not exist in Ctx2
+    ?assertMatch({error, {js_error, _}}, duktape:require(Ctx2, <<"mymod">>)),
+    %% Register different module with same name in Ctx2
+    ok = duktape:register_module(Ctx2, <<"mymod">>, <<"exports.value = 'ctx2';">>),
+    {ok, _} = duktape:require(Ctx2, <<"mymod">>),
+    ?assertEqual({ok, <<"ctx2">>}, duktape:eval(Ctx2, <<"require('mymod').value">>)),
+    %% Ctx1 should still have its own module
+    ?assertEqual({ok, <<"ctx1">>}, duktape:eval(Ctx1, <<"require('mymod').value">>)),
+    ok = duktape:destroy_context(Ctx1),
+    ok = duktape:destroy_context(Ctx2).
+
+isolation_after_destroy_test() ->
+    {ok, Ctx1} = duktape:new_context(),
+    {ok, Ctx2} = duktape:new_context(),
+    %% Set up state in both contexts
+    {ok, _} = duktape:eval(Ctx1, <<"var x = 100">>),
+    {ok, _} = duktape:eval(Ctx2, <<"var x = 200">>),
+    %% Destroy Ctx1
+    ok = duktape:destroy_context(Ctx1),
+    %% Ctx2 should still work fine
+    ?assertEqual({ok, 200}, duktape:eval(Ctx2, <<"x">>)),
+    ?assertEqual({ok, 400}, duktape:eval(Ctx2, <<"x * 2">>)),
+    %% Ctx1 should be invalid
+    ?assertMatch({error, invalid_context}, duktape:eval(Ctx1, <<"x">>)),
+    ok = duktape:destroy_context(Ctx2).
+
+isolation_global_objects_test() ->
+    {ok, Ctx1} = duktape:new_context(),
+    {ok, Ctx2} = duktape:new_context(),
+    %% Modify global object in Ctx1
+    {ok, _} = duktape:eval(Ctx1, <<"Object.prototype.customMethod = function() { return 42; }">>),
+    ?assertEqual({ok, 42}, duktape:eval(Ctx1, <<"({}).customMethod()">>)),
+    %% Ctx2 should not have the modification
+    ?assertMatch({error, {js_error, _}}, duktape:eval(Ctx2, <<"({}).customMethod()">>)),
+    ok = duktape:destroy_context(Ctx1),
+    ok = duktape:destroy_context(Ctx2).
+
+%% ============================================================================
+%% Test: Concurrent context access
+%% ============================================================================
+
+concurrent_contexts_test() ->
+    %% Create multiple contexts
+    Contexts = [begin {ok, Ctx} = duktape:new_context(), Ctx end || _ <- lists:seq(1, 5)],
+    %% Spawn processes to use each context concurrently
+    Self = self(),
+    Pids = [spawn_link(fun() ->
+        %% Each process does some work on its context
+        {ok, _} = duktape:eval(Ctx, <<"var sum = 0">>),
+        lists:foreach(fun(I) ->
+            {ok, _} = duktape:eval(Ctx, list_to_binary("sum += " ++ integer_to_list(I)))
+        end, lists:seq(1, 100)),
+        {ok, Result} = duktape:eval(Ctx, <<"sum">>),
+        Self ! {done, self(), Result}
+    end) || Ctx <- Contexts],
+    %% Wait for all processes
+    Results = [receive {done, Pid, R} -> R after 5000 -> timeout end || Pid <- Pids],
+    %% All should get the same result (sum 1..100 = 5050)
+    ?assertEqual([5050, 5050, 5050, 5050, 5050], Results),
+    %% Clean up
+    lists:foreach(fun(Ctx) -> ok = duktape:destroy_context(Ctx) end, Contexts).
+
+concurrent_same_context_test() ->
+    %% Test that multiple processes can safely use the same context
+    %% (mutex should prevent race conditions)
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"var counter = 0">>),
+    Self = self(),
+    NumProcs = 10,
+    NumOps = 50,
+    Pids = [spawn_link(fun() ->
+        lists:foreach(fun(_) ->
+            {ok, _} = duktape:eval(Ctx, <<"counter++">>)
+        end, lists:seq(1, NumOps)),
+        Self ! {done, self()}
+    end) || _ <- lists:seq(1, NumProcs)],
+    %% Wait for all processes
+    lists:foreach(fun(Pid) ->
+        receive {done, Pid} -> ok after 5000 -> ?assert(false) end
+    end, Pids),
+    %% Counter should equal NumProcs * NumOps
+    {ok, FinalCount} = duktape:eval(Ctx, <<"counter">>),
+    ?assertEqual(NumProcs * NumOps, FinalCount),
+    ok = duktape:destroy_context(Ctx).
+
+many_contexts_test() ->
+    %% Create many contexts to verify no resource leaks
+    NumContexts = 50,
+    Contexts = [begin {ok, Ctx} = duktape:new_context(), Ctx end || _ <- lists:seq(1, NumContexts)],
+    %% Do some work in each
+    lists:foreach(fun({Idx, Ctx}) ->
+        {ok, _} = duktape:eval(Ctx, list_to_binary("var id = " ++ integer_to_list(Idx))),
+        {ok, Id} = duktape:eval(Ctx, <<"id">>),
+        ?assertEqual(Idx, Id)
+    end, lists:zip(lists:seq(1, NumContexts), Contexts)),
+    %% Destroy all
+    lists:foreach(fun(Ctx) -> ok = duktape:destroy_context(Ctx) end, Contexts),
+    %% Verify all are destroyed
+    lists:foreach(fun(Ctx) ->
+        ?assertMatch({error, invalid_context}, duktape:eval(Ctx, <<"1">>))
+    end, Contexts).
+
+context_gc_isolation_test() ->
+    %% Verify that GC of one context doesn't affect another
+    {ok, Ctx1} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx1, <<"var persistent = 'I should survive'">>),
+    %% Create and abandon a context (let it be GC'd)
+    _Pid = spawn(fun() ->
+        {ok, Ctx2} = duktape:new_context(),
+        {ok, _} = duktape:eval(Ctx2, <<"var temp = 'temporary'">>)
+        %% Context abandoned here, will be GC'd
+    end),
+    timer:sleep(50),
+    erlang:garbage_collect(),
+    timer:sleep(10),
+    %% Ctx1 should still work
+    ?assertEqual({ok, <<"I should survive">>}, duktape:eval(Ctx1, <<"persistent">>)),
+    ok = duktape:destroy_context(Ctx1).
+
+context_auto_cleanup_test() ->
+    %% Verify that contexts are automatically cleaned up when no process holds a reference
+    %% This tests the NIF resource reference counting mechanism
+    Self = self(),
+    %% Create a context in a separate process
+    Pid = spawn(fun() ->
+        {ok, Ctx} = duktape:new_context(),
+        {ok, _} = duktape:eval(Ctx, <<"var data = 'test'">>),
+        %% Send context to parent
+        Self ! {context, Ctx},
+        %% Wait for signal to die
+        receive die -> ok end
+    end),
+    %% Receive the context
+    Ctx = receive {context, C} -> C after 1000 -> error(timeout) end,
+    %% Context should work while process is alive
+    ?assertEqual({ok, <<"test">>}, duktape:eval(Ctx, <<"data">>)),
+    %% Tell process to die
+    Pid ! die,
+    timer:sleep(10),
+    %% Context should still work because we hold a reference
+    ?assertEqual({ok, <<"test">>}, duktape:eval(Ctx, <<"data">>)),
+    %% Explicitly destroy
+    ok = duktape:destroy_context(Ctx).
+
+context_shared_between_processes_test() ->
+    %% Verify that a context can be shared between multiple processes
+    %% and remains valid as long as any process holds a reference
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"var counter = 0">>),
+    Self = self(),
+    %% Spawn processes that share the context
+    Pids = [spawn_link(fun() ->
+        %% Each process increments the counter
+        {ok, _} = duktape:eval(Ctx, <<"counter++">>),
+        Self ! {done, self()}
+    end) || _ <- lists:seq(1, 5)],
+    %% Wait for all processes
+    lists:foreach(fun(Pid) ->
+        receive {done, Pid} -> ok after 1000 -> error(timeout) end
+    end, Pids),
+    %% Counter should be 5
+    {ok, Count} = duktape:eval(Ctx, <<"counter">>),
+    ?assertEqual(5, Count),
+    %% Context should still work
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"counter * 2">>)),
+    ok = duktape:destroy_context(Ctx).
+
+context_cleanup_on_process_death_test() ->
+    %% Verify that when the only process holding a context dies,
+    %% the context is cleaned up (via GC)
+    Self = self(),
+    Pid = spawn(fun() ->
+        {ok, Ctx} = duktape:new_context(),
+        {ok, _} = duktape:eval(Ctx, <<"var x = 42">>),
+        Self ! {ctx, Ctx},
+        %% Keep the context alive until told to die
+        receive die -> ok end
+        %% Process exits, releasing its reference to Ctx
+    end),
+    Ctx = receive {ctx, C} -> C after 1000 -> error(timeout) end,
+    %% Context works while both processes hold it
+    ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"x">>)),
+    %% Tell the spawned process to die
+    Pid ! die,
+    timer:sleep(10),
+    %% We still hold a reference, so context should still work
+    ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"x">>)),
+    %% Now destroy from our side
+    ok = duktape:destroy_context(Ctx),
+    %% Should be invalid now
+    ?assertMatch({error, invalid_context}, duktape:eval(Ctx, <<"x">>)).
