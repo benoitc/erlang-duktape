@@ -69,12 +69,14 @@ run_smoke() {
 
 run_all() {
     echo "Running all benchmarks..."
-    rebar3 as bench shell --eval "${BENCH_MODULE}:run_all()." --eval "init:stop()."
+    rebar3 as bench compile
+    erl -pa _build/bench/lib/*/ebin -pa _build/bench/lib/*/bench -noshell -eval "${BENCH_MODULE}:run_all(), init:stop()."
 }
 
 run_single() {
     echo "Running benchmark: $1"
-    rebar3 as bench shell --eval "${BENCH_MODULE}:run($1)." --eval "init:stop()."
+    rebar3 as bench compile
+    erl -pa _build/bench/lib/*/ebin -pa _build/bench/lib/*/bench -noshell -eval "${BENCH_MODULE}:run($1), init:stop()."
 }
 
 # Parse arguments
