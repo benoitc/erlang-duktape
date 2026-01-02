@@ -21,13 +21,22 @@
 -export([
     info/0,
     new_context/0,
-    destroy_context/1
+    destroy_context/1,
+    eval/2
 ]).
 
 %% Types
--export_type([context/0]).
+-export_type([context/0, js_value/0]).
 
 -opaque context() :: reference().
+
+-type js_value() :: integer()
+                  | float()
+                  | binary()
+                  | true
+                  | false
+                  | null
+                  | undefined.
 
 %% NIF loading
 -compile(no_native).
@@ -70,6 +79,19 @@ new_context() ->
 destroy_context(Ctx) ->
     nif_destroy_context(Ctx).
 
+%% @doc Evaluate JavaScript code in a context.
+%% Returns the result of the last expression.
+%%
+%% Examples:
+%% ```
+%% {ok, 3} = duktape:eval(Ctx, <<"1 + 2">>).
+%% {ok, <<"hello">>} = duktape:eval(Ctx, <<"'hello'">>).
+%% {error, {js_error, _}} = duktape:eval(Ctx, <<"throw 'oops'">>).
+%% '''
+-spec eval(context(), iodata()) -> {ok, js_value()} | {error, term()}.
+eval(Ctx, Code) ->
+    nif_eval(Ctx, Code).
+
 %% ============================================================================
 %% Internal NIF stubs
 %% ============================================================================
@@ -77,3 +99,4 @@ destroy_context(Ctx) ->
 nif_info() -> ?nif_stub.
 nif_new_context() -> ?nif_stub.
 nif_destroy_context(_Ctx) -> ?nif_stub.
+nif_eval(_Ctx, _Code) -> ?nif_stub.

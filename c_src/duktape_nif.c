@@ -7,6 +7,7 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include "erl_nif.h"
 #include "duktape.h"
 
@@ -39,6 +40,7 @@ static ERL_NIF_TERM atom_false;
 static ERL_NIF_TERM atom_enomem;
 static ERL_NIF_TERM atom_invalid_context;
 static ERL_NIF_TERM atom_badarg;
+static ERL_NIF_TERM atom_js_error;
 
 /* ============================================================================
  * Resource management
@@ -80,6 +82,78 @@ get_context(ErlNifEnv *env, ERL_NIF_TERM term)
     }
 
     return res;
+}
+
+/* ============================================================================
+ * Type conversion: Duktape -> Erlang
+ * ============================================================================ */
+
+/* Convert a Duktape value at stack index to an Erlang term */
+static ERL_NIF_TERM
+duk_to_erlang(ErlNifEnv *env, duk_context *ctx, duk_idx_t idx)
+{
+    switch (duk_get_type(ctx, idx)) {
+        case DUK_TYPE_UNDEFINED:
+            return atom_undefined;
+
+        case DUK_TYPE_NULL:
+            return atom_null;
+
+        case DUK_TYPE_BOOLEAN:
+            return duk_get_boolean(ctx, idx) ? atom_true : atom_false;
+
+        case DUK_TYPE_NUMBER: {
+            double num = duk_get_number(ctx, idx);
+            /* Check if it's an integer */
+            if (floor(num) == num && num >= INT64_MIN && num <= INT64_MAX) {
+                return enif_make_int64(env, (int64_t)num);
+            }
+            return enif_make_double(env, num);
+        }
+
+        case DUK_TYPE_STRING: {
+            duk_size_t len;
+            const char *str = duk_get_lstring(ctx, idx, &len);
+            ERL_NIF_TERM bin;
+            unsigned char *buf = enif_make_new_binary(env, len, &bin);
+            if (buf) {
+                memcpy(buf, str, len);
+                return bin;
+            }
+            return atom_enomem;
+        }
+
+        case DUK_TYPE_OBJECT:
+            /* For now, return a string representation */
+            /* Full object conversion will be added in Step 6 */
+            duk_dup(ctx, idx);
+            {
+                const char *str = duk_safe_to_string(ctx, -1);
+                size_t len = strlen(str);
+                ERL_NIF_TERM bin;
+                unsigned char *buf = enif_make_new_binary(env, len, &bin);
+                if (buf) {
+                    memcpy(buf, str, len);
+                }
+                duk_pop(ctx);
+                return buf ? bin : atom_enomem;
+            }
+
+        default:
+            /* Unknown type - return string representation */
+            duk_dup(ctx, idx);
+            {
+                const char *str = duk_safe_to_string(ctx, -1);
+                size_t len = strlen(str);
+                ERL_NIF_TERM bin;
+                unsigned char *buf = enif_make_new_binary(env, len, &bin);
+                if (buf) {
+                    memcpy(buf, str, len);
+                }
+                duk_pop(ctx);
+                return buf ? bin : atom_enomem;
+            }
+    }
 }
 
 /* ============================================================================
@@ -160,6 +234,65 @@ nif_destroy_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return atom_ok;
 }
 
+/* Evaluate JavaScript code */
+static ERL_NIF_TERM
+nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+    ErlNifBinary js_code;
+    ERL_NIF_TERM result;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the JavaScript code as binary */
+    if (!enif_inspect_binary(env, argv[1], &js_code)) {
+        /* Try iolist */
+        if (!enif_inspect_iolist_as_binary(env, argv[1], &js_code)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Push the code as a string and evaluate */
+    duk_push_lstring(res->ctx, (const char *)js_code.data, js_code.size);
+
+    if (duk_peval(res->ctx) != 0) {
+        /* Error occurred */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = strlen(err_msg);
+        ERL_NIF_TERM err_bin;
+        unsigned char *err_buf = enif_make_new_binary(env, err_len, &err_bin);
+        if (err_buf) {
+            memcpy(err_buf, err_msg, err_len);
+        }
+        duk_pop(res->ctx);  /* Pop error */
+        enif_mutex_unlock(res->lock);
+
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_buf ? err_bin : atom_enomem));
+    }
+
+    /* Convert result to Erlang term */
+    result = duk_to_erlang(env, res->ctx, -1);
+    duk_pop(res->ctx);  /* Pop result */
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
 /* Get NIF information */
 static ERL_NIF_TERM
 nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -205,6 +338,7 @@ on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     atom_enomem = enif_make_atom(env, "enomem");
     atom_invalid_context = enif_make_atom(env, "invalid_context");
     atom_badarg = enif_make_atom(env, "badarg");
+    atom_js_error = enif_make_atom(env, "js_error");
 
     return 0;
 }
@@ -230,7 +364,8 @@ on_unload(ErlNifEnv *env, void *priv_data)
 static ErlNifFunc nif_funcs[] = {
     {"nif_info", 0, nif_info, 0},
     {"nif_new_context", 0, nif_new_context, 0},
-    {"nif_destroy_context", 1, nif_destroy_context, 0}
+    {"nif_destroy_context", 1, nif_destroy_context, 0},
+    {"nif_eval", 2, nif_eval, 0}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)
