@@ -16,6 +16,9 @@ priv/*.dll
 rebar.lock
 .rebar3/
 
+# Generated docs
+doc/
+
 # Editor
 *~
 *.swp
