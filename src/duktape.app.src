@@ -9,5 +9,5 @@
   ]},
   {env, []},
   {licenses, ["MIT"]},
-  {links, []}
+  {links, [{"GitHub", "https://github.com/benoitc/erlang-duktape"}]}
  ]}.
