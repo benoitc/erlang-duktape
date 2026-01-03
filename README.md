@@ -388,22 +388,46 @@ Contexts are managed as Erlang NIF resources with automatic cleanup:
 
 Performance benchmarks on Apple M4 Pro, Erlang/OTP 28:
 
+### Core Operations
+
 | Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
 |-----------|--------:|----------:|---------:|---------:|
-| eval_simple | 2,633 | 0.380 | 0.418 | 0.458 |
-| eval_complex | 2,355 | 0.425 | 0.469 | 0.513 |
-| eval_bindings_small (5 vars) | 2,632 | 0.380 | 0.418 | 0.457 |
-| eval_bindings_large (50 vars) | 1,688 | 0.593 | 0.715 | 0.773 |
-| call_no_args | 2,513 | 0.398 | 0.488 | 0.532 |
-| call_with_args (5 args) | 2,478 | 0.404 | 0.492 | 0.533 |
-| call_many_args (20 args) | 2,176 | 0.460 | 0.540 | 0.604 |
-| type_convert_simple | 2,548 | 0.392 | 0.461 | 0.524 |
-| type_convert_array (1000 elem) | 2,121 | 0.472 | 0.555 | 0.594 |
-| type_convert_nested | 2,489 | 0.402 | 0.485 | 0.520 |
-| context_create | 2,702 | 0.370 | 0.430 | 0.485 |
-| module_require_cached | 2,230 | 0.448 | 0.525 | 0.577 |
-| concurrent_same_context | 120,617 | 0.829 | 1.070 | 1.199 |
-| concurrent_many_contexts | 33,276 | 3.005 | 3.380 | 3.873 |
+| eval_simple | 1,931 | 0.518 | 0.542 | 0.562 |
+| eval_complex | 1,775 | 0.563 | 0.588 | 0.613 |
+| eval_bindings_small (5 vars) | 1,921 | 0.521 | 0.544 | 0.562 |
+| eval_bindings_large (50 vars) | 1,277 | 0.783 | 0.892 | 0.916 |
+| call_no_args | 1,606 | 0.623 | 0.680 | 0.711 |
+| call_with_args (5 args) | 1,606 | 0.623 | 0.685 | 0.708 |
+| call_many_args (20 args) | 1,515 | 0.660 | 0.741 | 0.765 |
+| type_convert_simple | 1,734 | 0.577 | 0.661 | 0.692 |
+| type_convert_array (1000 elem) | 1,485 | 0.673 | 0.741 | 0.763 |
+| type_convert_nested | 1,666 | 0.600 | 0.679 | 0.702 |
+| context_create | 1,757 | 0.569 | 0.627 | 0.643 |
+| module_require_cached | 1,494 | 0.669 | 0.735 | 0.768 |
+
+### Erlang Function Registration
+
+| Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
+|-----------|--------:|----------:|---------:|---------:|
+| register_function_simple | 1,614 | 0.620 | 0.676 | 0.714 |
+| register_function_complex_args | 1,490 | 0.671 | 0.748 | 1.232 |
+| register_function_nested (5 calls) | 1,464 | 0.683 | 0.805 | 0.876 |
+| register_function_many_calls (10) | 9,925 | 1.008 | 1.170 | 1.279 |
+
+### Event Framework
+
+| Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
+|-----------|--------:|----------:|---------:|---------:|
+| event_emit | 1,415 | 0.707 | 0.832 | 0.903 |
+| event_send | 1,640 | 0.610 | 0.688 | 0.717 |
+| console_log | 1,406 | 0.711 | 0.834 | 0.938 |
+
+### Concurrency
+
+| Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
+|-----------|--------:|----------:|---------:|---------:|
+| concurrent_same_context (10 procs) | 54,111 | 1.848 | 2.200 | 2.455 |
+| concurrent_many_contexts (10 procs) | 22,628 | 4.419 | 4.996 | 5.161 |
 
 Run benchmarks yourself:
 

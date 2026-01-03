@@ -40,7 +40,16 @@
     bench_context_create/1,
     bench_module_require_cached/1,
     bench_concurrent_same_context/1,
-    bench_concurrent_many_contexts/1
+    bench_concurrent_many_contexts/1,
+    %% Erlang function registration benchmarks
+    bench_register_function_simple/1,
+    bench_register_function_complex_args/1,
+    bench_register_function_nested/1,
+    bench_register_function_many_calls/1,
+    %% Event framework benchmarks
+    bench_event_emit/1,
+    bench_event_send/1,
+    bench_console_log/1
 ]).
 
 -define(DEFAULT_OPTS, #{
@@ -98,7 +107,16 @@ run_all(Opts) ->
         context_create,
         module_require_cached,
         concurrent_same_context,
-        concurrent_many_contexts
+        concurrent_many_contexts,
+        %% Erlang function registration
+        register_function_simple,
+        register_function_complex_args,
+        register_function_nested,
+        register_function_many_calls,
+        %% Event framework
+        event_emit,
+        event_send,
+        console_log
     ],
     Results = lists:map(fun(Name) ->
         {ok, Result} = run(Name, MergedOpts),
@@ -368,6 +386,115 @@ bench_concurrent_many_contexts(_Opts) ->
 
     NumProcs * OpsPerProc.
 
+%%--------------------------------------------------------------------
+%% Erlang Function Registration Benchmarks
+%%--------------------------------------------------------------------
+
+%% Simple Erlang function call from JavaScript
+bench_register_function_simple(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, double, fun([N]) -> N * 2 end),
+    try
+        {ok, _} = duktape:eval(Ctx, <<"double(21)">>),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% Erlang function with complex arguments (map, array)
+bench_register_function_complex_args(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, process_data, fun([Data]) ->
+        %% Just return the data back (tests serialization overhead)
+        Data
+    end),
+    try
+        {ok, _} = duktape:eval(Ctx, <<"
+            process_data({
+                name: 'test',
+                values: [1, 2, 3, 4, 5],
+                nested: { a: 1, b: 2 }
+            })
+        ">>),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% Nested Erlang function calls (tests trampoline overhead)
+bench_register_function_nested(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, increment, fun([N]) -> N + 1 end),
+    try
+        %% Chain of 5 nested calls
+        {ok, _} = duktape:eval(Ctx, <<"increment(increment(increment(increment(increment(0)))))">>),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% Many sequential Erlang function calls in one eval
+bench_register_function_many_calls(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, add_one, fun([N]) -> N + 1 end),
+    try
+        %% 10 sequential calls
+        {ok, _} = duktape:eval(Ctx, <<"
+            var sum = 0;
+            for (var i = 0; i < 10; i++) {
+                sum = add_one(sum);
+            }
+            sum
+        ">>),
+        10  % 10 Erlang function calls
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%%--------------------------------------------------------------------
+%% Event Framework Benchmarks
+%%--------------------------------------------------------------------
+
+%% Erlang.emit() from JavaScript (requires handler)
+bench_event_emit(_Opts) ->
+    Self = self(),
+    {ok, Ctx} = duktape:new_context(#{handler => Self}),
+    try
+        {ok, _} = duktape:eval(Ctx, <<"Erlang.emit('test', {value: 42})">>),
+        %% Drain the message
+        receive {duktape, test, _} -> ok after 100 -> ok end,
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% duktape:send() to JavaScript callback
+bench_event_send(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"
+        var lastValue = null;
+        Erlang.on('data', function(d) { lastValue = d; return 'ok'; });
+    ">>),
+    try
+        {ok, _} = duktape:send(Ctx, data, #{value => 42}),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% console.log() (requires handler)
+bench_console_log(_Opts) ->
+    Self = self(),
+    {ok, Ctx} = duktape:new_context(#{handler => Self}),
+    try
+        {ok, _} = duktape:eval(Ctx, <<"console.log('benchmark message', 42)">>),
+        %% Drain the message
+        receive {duktape, log, _} -> ok after 100 -> ok end,
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
@@ -391,7 +518,16 @@ get_bench_fun(type_convert_nested) -> fun bench_type_convert_nested/1;
 get_bench_fun(context_create) -> fun bench_context_create/1;
 get_bench_fun(module_require_cached) -> fun bench_module_require_cached/1;
 get_bench_fun(concurrent_same_context) -> fun bench_concurrent_same_context/1;
-get_bench_fun(concurrent_many_contexts) -> fun bench_concurrent_many_contexts/1.
+get_bench_fun(concurrent_many_contexts) -> fun bench_concurrent_many_contexts/1;
+%% Erlang function registration
+get_bench_fun(register_function_simple) -> fun bench_register_function_simple/1;
+get_bench_fun(register_function_complex_args) -> fun bench_register_function_complex_args/1;
+get_bench_fun(register_function_nested) -> fun bench_register_function_nested/1;
+get_bench_fun(register_function_many_calls) -> fun bench_register_function_many_calls/1;
+%% Event framework
+get_bench_fun(event_emit) -> fun bench_event_emit/1;
+get_bench_fun(event_send) -> fun bench_event_send/1;
+get_bench_fun(console_log) -> fun bench_console_log/1.
 
 run_iterations(BenchFun, Iterations, Opts) ->
     run_iterations(BenchFun, Iterations, Opts, [], []).
