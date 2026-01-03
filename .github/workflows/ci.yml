@@ -58,10 +58,28 @@ jobs:
         run: rebar3 dialyzer
         continue-on-error: true
 
+  freebsd:
+    name: FreeBSD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y erlang rebar3 cmake
+          run: |
+            rebar3 compile
+            rebar3 eunit
+
   docs:
     name: Build docs
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, freebsd]
 
     steps:
       - name: Checkout
