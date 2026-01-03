@@ -713,14 +713,18 @@ erlang_emit(duk_context *ctx)
         return 0;  /* No handler, silently ignore */
     }
 
-    /* Get event type (string → atom) */
-    const char *type_str = duk_require_string(ctx, 0);
-    ERL_NIF_TERM type_atom = enif_make_atom(res->event_env, type_str);
+    /* Get event type (string → binary to prevent atom table exhaustion) */
+    duk_size_t type_len;
+    const char *type_str = duk_get_lstring(ctx, 0, &type_len);
+    if (!type_str) {
+        return 0;
+    }
+    ERL_NIF_TERM type_bin = make_binary_from_string(res->event_env, type_str, type_len, atom_enomem);
 
     /* Convert data to Erlang term */
     ERL_NIF_TERM data = duk_to_erlang(res->event_env, ctx, 1);
 
-    emit_event(res, type_atom, data);
+    emit_event(res, type_bin, data);
 
     return 0;
 }
@@ -741,14 +745,17 @@ erlang_log(duk_context *ctx)
         return 0;
     }
 
-    /* Get level */
+    /* Get level - use atoms for known levels, binary for unknown to prevent atom exhaustion */
     const char *level_str = duk_require_string(ctx, 0);
-    ERL_NIF_TERM level_atom;
-    if (strcmp(level_str, "debug") == 0) level_atom = atom_debug;
-    else if (strcmp(level_str, "info") == 0) level_atom = atom_info;
-    else if (strcmp(level_str, "warning") == 0) level_atom = atom_warning;
-    else if (strcmp(level_str, "error") == 0) level_atom = atom_error;
-    else level_atom = enif_make_atom(res->event_env, level_str);
+    ERL_NIF_TERM level_term;
+    if (strcmp(level_str, "debug") == 0) level_term = atom_debug;
+    else if (strcmp(level_str, "info") == 0) level_term = atom_info;
+    else if (strcmp(level_str, "warning") == 0) level_term = atom_warning;
+    else if (strcmp(level_str, "error") == 0) level_term = atom_error;
+    else {
+        /* Unknown level - use binary to prevent atom table exhaustion */
+        level_term = make_binary_from_string(res->event_env, level_str, strlen(level_str), atom_enomem);
+    }
 
     /* Build message from remaining args */
     int nargs = duk_get_top(ctx);
@@ -770,12 +777,12 @@ erlang_log(duk_context *ctx)
     /* Create message binary */
     ERL_NIF_TERM msg_bin = make_binary_from_string(res->event_env, msg, msg_len, atom_enomem);
 
-    /* Create data map: #{level => atom, message => binary} */
+    /* Create data map: #{level => atom|binary, message => binary} */
     ERL_NIF_TERM keys[2];
     ERL_NIF_TERM vals[2];
     keys[0] = atom_level;
     keys[1] = atom_message;
-    vals[0] = level_atom;
+    vals[0] = level_term;
     vals[1] = msg_bin;
     ERL_NIF_TERM data;
     enif_make_map_from_arrays(res->event_env, keys, vals, 2, &data);

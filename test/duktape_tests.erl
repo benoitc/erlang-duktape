@@ -1148,7 +1148,8 @@ erlang_emit_test() ->
     {ok, Ctx} = duktape:new_context(#{handler => self()}),
     {ok, undefined} = duktape:eval(Ctx, <<"Erlang.emit('custom', {foo: 'bar', num: 42})">>),
     receive
-        {duktape, custom, #{<<"foo">> := <<"bar">>, <<"num">> := 42}} ->
+        %% Event type is now a binary to prevent atom table exhaustion
+        {duktape, <<"custom">>, #{<<"foo">> := <<"bar">>, <<"num">> := 42}} ->
             ok
     after 1000 ->
         ?assert(false)
@@ -1267,9 +1268,9 @@ bidirectional_test() ->
     ">>),
     %% Send for processing
     {ok, 84} = duktape:send(Ctx, process, #{value => 42}),
-    %% Should receive result event
+    %% Should receive result event (event type is binary)
     receive
-        {duktape, result, #{<<"input">> := 42, <<"output">> := 84}} ->
+        {duktape, <<"result">>, #{<<"input">> := 42, <<"output">> := 84}} ->
             ok
     after 1000 ->
         ?assert(false)
