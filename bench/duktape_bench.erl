@@ -49,7 +49,12 @@
     %% Event framework benchmarks
     bench_event_emit/1,
     bench_event_send/1,
-    bench_console_log/1
+    bench_console_log/1,
+    %% CBOR benchmarks
+    bench_cbor_encode_simple/1,
+    bench_cbor_encode_complex/1,
+    bench_cbor_decode_simple/1,
+    bench_cbor_roundtrip/1
 ]).
 
 -define(DEFAULT_OPTS, #{
@@ -116,7 +121,12 @@ run_all(Opts) ->
         %% Event framework
         event_emit,
         event_send,
-        console_log
+        console_log,
+        %% CBOR
+        cbor_encode_simple,
+        cbor_encode_complex,
+        cbor_decode_simple,
+        cbor_roundtrip
     ],
     Results = lists:map(fun(Name) ->
         {ok, Result} = run(Name, MergedOpts),
@@ -495,6 +505,73 @@ bench_console_log(_Opts) ->
         duktape:destroy_context(Ctx)
     end.
 
+%%--------------------------------------------------------------------
+%% CBOR Encoding/Decoding Benchmarks
+%%--------------------------------------------------------------------
+
+%% Simple CBOR encode (integer, string, small map)
+bench_cbor_encode_simple(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    Data = #{name => <<"test">>, value => 42, active => true},
+    try
+        {ok, _} = duktape:cbor_encode(Ctx, Data),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% Complex CBOR encode (nested structures, arrays)
+bench_cbor_encode_complex(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    Data = #{
+        users => [
+            #{name => <<"Alice">>, age => 30, scores => [95, 87, 92]},
+            #{name => <<"Bob">>, age => 25, scores => [88, 91, 85]},
+            #{name => <<"Carol">>, age => 35, scores => [92, 89, 94]}
+        ],
+        metadata => #{
+            version => 1,
+            created => <<"2024-01-01T00:00:00Z">>,
+            tags => [<<"benchmark">>, <<"test">>, <<"cbor">>]
+        }
+    },
+    try
+        {ok, _} = duktape:cbor_encode(Ctx, Data),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% Simple CBOR decode (pre-encoded data)
+bench_cbor_decode_simple(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Pre-encode the data once
+    Data = #{name => <<"test">>, value => 42, active => true},
+    {ok, CborBin} = duktape:cbor_encode(Ctx, Data),
+    try
+        {ok, _} = duktape:cbor_decode(Ctx, CborBin),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
+%% CBOR roundtrip (encode then decode)
+bench_cbor_roundtrip(_Opts) ->
+    {ok, Ctx} = duktape:new_context(),
+    Data = #{
+        id => 12345,
+        name => <<"benchmark">>,
+        values => [256, 512, 1024],  %% > 255 to avoid iolist
+        nested => #{inner => true}
+    },
+    try
+        {ok, Bin} = duktape:cbor_encode(Ctx, Data),
+        {ok, _} = duktape:cbor_decode(Ctx, Bin),
+        1
+    after
+        duktape:destroy_context(Ctx)
+    end.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
@@ -527,7 +604,12 @@ get_bench_fun(register_function_many_calls) -> fun bench_register_function_many_
 %% Event framework
 get_bench_fun(event_emit) -> fun bench_event_emit/1;
 get_bench_fun(event_send) -> fun bench_event_send/1;
-get_bench_fun(console_log) -> fun bench_console_log/1.
+get_bench_fun(console_log) -> fun bench_console_log/1;
+%% CBOR
+get_bench_fun(cbor_encode_simple) -> fun bench_cbor_encode_simple/1;
+get_bench_fun(cbor_encode_complex) -> fun bench_cbor_encode_complex/1;
+get_bench_fun(cbor_decode_simple) -> fun bench_cbor_decode_simple/1;
+get_bench_fun(cbor_roundtrip) -> fun bench_cbor_roundtrip/1.
 
 run_iterations(BenchFun, Iterations, Opts) ->
     run_iterations(BenchFun, Iterations, Opts, [], []).
