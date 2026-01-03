@@ -1,5 +1,8 @@
 # Duktape
 
+[![GitLab CI](https://gitlab.com/benoitc/erlang-duktape/badges/main/pipeline.svg)](https://gitlab.com/benoitc/erlang-duktape/-/pipelines)
+[![Hex.pm](https://img.shields.io/hexpm/v/duktape.svg)](https://hex.pm/packages/duktape)
+
 Duktape JavaScript engine for Erlang.
 
 This library embeds the [Duktape](https://duktape.org/) JavaScript engine (v2.7.0) as an Erlang NIF, allowing you to evaluate JavaScript code directly from Erlang.
