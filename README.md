@@ -70,6 +70,10 @@ ok = duktape:register_module(Ctx, <<"utils">>, <<"
 
 ## API Reference
 
+- [Context Management](#context-management) | [Evaluation](#evaluation) | [Function Calls](#function-calls) | [CommonJS Modules](#commonjs-modules)
+- [Event Framework](#event-framework) | [Erlang Functions](#erlang-functions) | [CBOR Encoding/Decoding](#cbor-encodingdecoding)
+- [Utility](#utility) | [Metrics](#metrics)
+
 ### Context Management
 
 #### `new_context() -> {ok, context()} | {error, term()}`

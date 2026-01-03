@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Per-context memory tracking via custom allocator wrapper
   - 10 new tests for metrics functionality (173 total)
 
+- **Documentation Guides**: Comprehensive ex_doc documentation
+  - Getting Started guide with installation and basic usage
+  - Event Framework guide for bidirectional communication
+  - Erlang Functions guide for calling Erlang from JavaScript
+  - CBOR Encoding guide for binary serialization
+  - Metrics guide for memory monitoring
+
 ### Changed
 
 - **Dirty NIF Scheduling**: CPU-bound operations now run on dirty schedulers
