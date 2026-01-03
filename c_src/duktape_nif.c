@@ -1847,6 +1847,140 @@ nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 }
 
 /* ============================================================================
+ * CBOR encoding/decoding
+ * ============================================================================ */
+
+/* Encode an Erlang value to CBOR binary */
+static ERL_NIF_TERM
+nif_cbor_encode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Convert Erlang value to JS value on Duktape stack */
+    if (erlang_to_duk(env, res->ctx, argv[1]) != 0) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    /* Encode to CBOR - replaces top of stack with buffer */
+    duk_cbor_encode(res->ctx, -1, 0);
+
+    /* Get the buffer data */
+    duk_size_t cbor_len;
+    const void *cbor_data = duk_get_buffer_data(res->ctx, -1, &cbor_len);
+
+    if (cbor_data == NULL) {
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    /* Create Erlang binary from CBOR data */
+    ERL_NIF_TERM result_bin;
+    unsigned char *bin_data = enif_make_new_binary(env, cbor_len, &result_bin);
+    if (bin_data == NULL) {
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    if (cbor_len > 0) {
+        safe_memcpy(bin_data, cbor_len, cbor_data, cbor_len);
+    }
+
+    duk_pop(res->ctx);
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result_bin);
+}
+
+/* Helper for CBOR decode safe call */
+static duk_ret_t
+cbor_decode_safe_call(duk_context *ctx, void *udata)
+{
+    (void)udata;
+    duk_cbor_decode(ctx, -1, 0);
+    return 1;
+}
+
+/* Decode a CBOR binary to Erlang value */
+static ERL_NIF_TERM
+nif_cbor_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+    ErlNifBinary cbor_bin;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get CBOR binary */
+    if (!enif_inspect_binary(env, argv[1], &cbor_bin)) {
+        if (!enif_inspect_iolist_as_binary(env, argv[1], &cbor_bin)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Push CBOR data as buffer */
+    void *buf = duk_push_fixed_buffer(res->ctx, cbor_bin.size);
+    if (buf == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    if (cbor_bin.size > 0) {
+        safe_memcpy(buf, cbor_bin.size, cbor_bin.data, cbor_bin.size);
+    }
+
+    /* Decode CBOR - use protected call to catch errors */
+    if (duk_safe_call(res->ctx, cbor_decode_safe_call, NULL, 1, 1) != DUK_EXEC_SUCCESS) {
+        /* Decoding failed - get error message */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
+        duk_pop(res->ctx);
+        enif_mutex_unlock(res->lock);
+
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_bin));
+    }
+
+    /* Convert JS value to Erlang term */
+    ERL_NIF_TERM result = duk_to_erlang(env, res->ctx, -1);
+
+    duk_pop(res->ctx);
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
+/* ============================================================================
  * NIF initialization
  * ============================================================================ */
 
@@ -1927,7 +2061,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_send", 3, nif_send, 0},
     {"nif_register_erlang_function", 2, nif_register_erlang_function, 0},
     {"nif_call_complete", 2, nif_call_complete, 0},
-    {"nif_eval_resume", 1, nif_eval_resume, 0}
+    {"nif_eval_resume", 1, nif_eval_resume, 0},
+    {"nif_cbor_encode", 2, nif_cbor_encode, 0},
+    {"nif_cbor_decode", 2, nif_cbor_decode, 0}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)

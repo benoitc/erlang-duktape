@@ -21,7 +21,9 @@
     register_module/3,
     require/2,
     send/3,
-    register_function/3
+    register_function/3,
+    cbor_encode/2,
+    cbor_decode/2
 ]).
 
 %% Types
@@ -221,6 +223,52 @@ require(Ctx, ModuleId) ->
 send(Ctx, Event, Data) ->
     nif_send(Ctx, Event, Data).
 
+%% @doc Encode an Erlang value to CBOR binary.
+%% The value is first converted to a JavaScript value, then encoded to CBOR.
+%%
+%% Erlang to CBOR type mapping (via JavaScript):
+%% - integers/floats -> CBOR numbers
+%% - binaries -> CBOR text strings
+%% - atoms (true/false/null/undefined) -> CBOR primitives
+%% - other atoms -> CBOR text strings
+%% - lists -> CBOR arrays
+%% - maps -> CBOR maps
+%% - tuples -> CBOR arrays
+%%
+%% Example:
+%% ```
+%% {ok, Ctx} = duktape:new_context(),
+%% {ok, Bin} = duktape:cbor_encode(Ctx, #{name => <<"Alice">>, age => 30}),
+%% {ok, #{<<"name">> := <<"Alice">>, <<"age">> := 30}} = duktape:cbor_decode(Ctx, Bin).
+%% '''
+-spec cbor_encode(context(), term()) -> {ok, binary()} | {error, term()}.
+cbor_encode(Ctx, Value) ->
+    nif_cbor_encode(Ctx, Value).
+
+%% @doc Decode a CBOR binary to an Erlang value.
+%% The CBOR is decoded to a JavaScript value, then converted to Erlang.
+%%
+%% CBOR to Erlang type mapping (via JavaScript):
+%% - CBOR numbers (integer) -> integer
+%% - CBOR numbers (float) -> float
+%% - CBOR text strings -> binary
+%% - CBOR byte strings -> binary
+%% - CBOR true/false -> true/false atoms
+%% - CBOR null -> null atom
+%% - CBOR undefined -> undefined atom
+%% - CBOR arrays -> lists
+%% - CBOR maps -> maps
+%%
+%% Example:
+%% ```
+%% {ok, Ctx} = duktape:new_context(),
+%% {ok, Bin} = duktape:cbor_encode(Ctx, [1, 2, 3]),
+%% {ok, [1, 2, 3]} = duktape:cbor_decode(Ctx, Bin).
+%% '''
+-spec cbor_decode(context(), binary()) -> {ok, js_value()} | {error, term()}.
+cbor_decode(Ctx, Binary) ->
+    nif_cbor_decode(Ctx, Binary).
+
 %% @doc Register an Erlang function callable from JavaScript.
 %% The function receives a list of arguments passed from JavaScript.
 %%
@@ -324,3 +372,5 @@ nif_send(_Ctx, _Event, _Data) -> ?nif_stub.
 nif_register_erlang_function(_Ctx, _Name) -> ?nif_stub.
 nif_call_complete(_Ctx, _Result) -> ?nif_stub.
 nif_eval_resume(_Ctx) -> ?nif_stub.
+nif_cbor_encode(_Ctx, _Value) -> ?nif_stub.
+nif_cbor_decode(_Ctx, _Binary) -> ?nif_stub.

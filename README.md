@@ -319,6 +319,30 @@ end),
 
 **Note:** Registered functions are stored in the calling process's dictionary. The process that registers the function must also be the one that calls `eval/call`.
 
+### CBOR Encoding/Decoding
+
+Duktape has built-in CBOR (Concise Binary Object Representation) support.
+
+#### `cbor_encode(Ctx, Value) -> {ok, binary()} | {error, term()}`
+
+Encode an Erlang value to CBOR binary. The value is first converted to a JavaScript value, then encoded to CBOR.
+
+```erlang
+{ok, Ctx} = duktape:new_context(),
+{ok, Bin} = duktape:cbor_encode(Ctx, #{name => <<"Alice">>, age => 30}).
+```
+
+#### `cbor_decode(Ctx, Binary) -> {ok, Value} | {error, term()}`
+
+Decode a CBOR binary to an Erlang value. The CBOR is decoded to a JavaScript value, then converted to Erlang.
+
+```erlang
+{ok, Decoded} = duktape:cbor_decode(Ctx, Bin),
+%% #{<<"name">> => <<"Alice">>, <<"age">> => 30}
+```
+
+CBOR type mappings follow the same rules as regular Erlang ↔ JavaScript type conversions.
+
 ### Utility
 
 #### `info() -> {ok, string()}`

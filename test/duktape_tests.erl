@@ -1435,3 +1435,191 @@ register_function_atom_return_test() ->
     ok = duktape:register_function(Ctx, get_status, fun([]) -> ok end),
     {ok, <<"ok">>} = duktape:eval(Ctx, <<"get_status()">>),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% CBOR Encoding/Decoding Tests
+%% ============================================================================
+
+%% Test: Basic CBOR encode/decode roundtrip with integer
+cbor_integer_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, 42),
+    ?assert(is_binary(Bin)),
+    {ok, 42} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with negative integer
+cbor_negative_integer_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, -100),
+    {ok, -100} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with float
+cbor_float_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, 3.14),
+    {ok, Decoded} = duktape:cbor_decode(Ctx, Bin),
+    ?assert(abs(Decoded - 3.14) < 0.001),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with binary/string
+cbor_string_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, <<"hello world">>),
+    {ok, <<"hello world">>} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with empty string
+cbor_empty_string_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, <<"">>),
+    {ok, <<"">>} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with boolean true
+cbor_true_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, true),
+    {ok, true} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with boolean false
+cbor_false_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, false),
+    {ok, false} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with null
+cbor_null_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, null),
+    {ok, null} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with undefined
+cbor_undefined_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, undefined),
+    {ok, undefined} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with simple array
+%% Note: Use values > 255 to avoid iolist detection
+cbor_array_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, [100, 200, 300]),
+    {ok, [100, 200, 300]} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with empty array
+cbor_empty_array_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Empty list is converted to empty string (iolist), so use tuple
+    {ok, Bin} = duktape:cbor_encode(Ctx, {}),
+    {ok, []} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with map
+cbor_map_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, #{<<"key">> => <<"value">>}),
+    {ok, #{<<"key">> := <<"value">>}} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with empty map
+cbor_empty_map_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, #{}),
+    {ok, #{}} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with nested structure
+%% Note: Use values > 255 to avoid iolist detection
+cbor_nested_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Data = #{
+        <<"name">> => <<"test">>,
+        <<"numbers">> => [100, 200, 300],
+        <<"nested">> => #{<<"inner">> => true}
+    },
+    {ok, Bin} = duktape:cbor_encode(Ctx, Data),
+    {ok, Decoded} = duktape:cbor_decode(Ctx, Bin),
+    ?assertEqual(<<"test">>, maps:get(<<"name">>, Decoded)),
+    ?assertEqual([100, 200, 300], maps:get(<<"numbers">>, Decoded)),
+    ?assertEqual(#{<<"inner">> => true}, maps:get(<<"nested">>, Decoded)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with atom keys
+cbor_atom_key_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, #{name => <<"Alice">>, age => 30}),
+    {ok, Decoded} = duktape:cbor_decode(Ctx, Bin),
+    ?assertEqual(<<"Alice">>, maps:get(<<"name">>, Decoded)),
+    ?assertEqual(30, maps:get(<<"age">>, Decoded)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR decode invalid data returns error
+cbor_decode_invalid_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Result = duktape:cbor_decode(Ctx, <<"not valid cbor data">>),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode with tuple (becomes array)
+cbor_tuple_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Bin} = duktape:cbor_encode(Ctx, {1, 2, 3}),
+    {ok, [1, 2, 3]} = duktape:cbor_decode(Ctx, Bin),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode/decode with large data
+%% Note: Use values > 255 to avoid iolist detection
+cbor_large_data_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    LargeList = lists:seq(256, 355),  %% 100 elements, all > 255
+    {ok, Bin} = duktape:cbor_encode(Ctx, LargeList),
+    {ok, Decoded} = duktape:cbor_decode(Ctx, Bin),
+    ?assertEqual(LargeList, Decoded),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR with destroyed context returns error
+cbor_destroyed_context_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:destroy_context(Ctx),
+    ?assertMatch({error, invalid_context}, duktape:cbor_encode(Ctx, 42)),
+    ?assertMatch({error, invalid_context}, duktape:cbor_decode(Ctx, <<16#18, 42>>)).
+
+%% Test: CBOR encode/decode preserves data types
+cbor_type_preservation_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    Data = [
+        42,
+        -17,
+        3.14159,
+        <<"hello">>,
+        true,
+        false,
+        null
+    ],
+    {ok, Bin} = duktape:cbor_encode(Ctx, Data),
+    {ok, [I, N, F, S, T, Fa, Nu]} = duktape:cbor_decode(Ctx, Bin),
+    ?assertEqual(42, I),
+    ?assertEqual(-17, N),
+    ?assert(abs(F - 3.14159) < 0.0001),
+    ?assertEqual(<<"hello">>, S),
+    ?assertEqual(true, T),
+    ?assertEqual(false, Fa),
+    ?assertEqual(null, Nu),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: CBOR encode with badarg
+cbor_encode_badarg_test() ->
+    ?assertMatch({error, invalid_context}, duktape:cbor_encode(not_a_context, 42)).
+
+%% Test: CBOR decode with badarg
+cbor_decode_badarg_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertMatch({error, badarg}, duktape:cbor_decode(Ctx, not_binary)),
+    ok = duktape:destroy_context(Ctx).

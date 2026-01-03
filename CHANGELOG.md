@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CBOR Encoding/Decoding**: Built-in CBOR binary format support
+  - `cbor_encode/2` - encode Erlang values to CBOR binary
+  - `cbor_decode/2` - decode CBOR binary to Erlang values
+  - Uses Duktape's native CBOR implementation
+
 - **Erlang Function Registration**: Call Erlang functions synchronously from JavaScript
   - `register_function/3` - register Erlang funs or `{Module, Function}` tuples
   - Trampoline pattern enables nested calls (e.g., `double(double(5))`)
@@ -24,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `console.log/info/warn/error/debug` support
 
 - New performance benchmarks for register_function and events
-- Comprehensive test coverage (141 tests)
+- Comprehensive test coverage (163 tests)
 
 ## [0.1.0] - 2025-01-03
 
