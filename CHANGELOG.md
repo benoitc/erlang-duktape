@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-01-03
+
+### Added
+
+- **Execution Timeouts**: Prevent infinite loops from blocking dirty scheduler threads
+  - `eval/3` and `eval/4` accept timeout in milliseconds or `infinity`
+  - `call/3` and `call/4` accept timeout in milliseconds or `infinity`
+  - Default timeout of 5000ms for all eval/call operations
+  - Returns `{error, timeout}` when execution exceeds limit
+  - Context remains valid after timeout for subsequent calls
+  - Uses Duktape's native interrupt mechanism with monotonic clock
+
 ## [1.0.0] - 2026-01-03
 
 ### Added
