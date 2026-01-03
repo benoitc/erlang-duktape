@@ -16,8 +16,10 @@
     destroy_context/1,
     eval/2,
     eval/3,
+    eval/4,
     call/2,
     call/3,
+    call/4,
     register_module/3,
     require/2,
     send/3,
@@ -62,6 +64,8 @@
 -on_load(on_load/0).
 
 -define(nif_stub, nif_stub_error(?LINE)).
+-define(DEFAULT_TIMEOUT, 5000).
+
 nif_stub_error(Line) ->
     erlang:nif_error({nif_not_loaded, module, ?MODULE, line, Line}).
 
@@ -137,10 +141,12 @@ destroy_context(Ctx) ->
 %% '''
 -spec eval(context(), iodata()) -> {ok, js_value()} | {error, term()}.
 eval(Ctx, Code) ->
-    eval_loop(Ctx, nif_eval(Ctx, Code)).
+    eval(Ctx, Code, ?DEFAULT_TIMEOUT).
 
-%% @doc Evaluate JavaScript code with variable bindings.
-%% Bindings are set as global variables before evaluation.
+%% @doc Evaluate JavaScript code with variable bindings or timeout.
+%%
+%% When the third argument is a map, it's treated as variable bindings.
+%% When the third argument is an integer or `infinity', it's treated as a timeout.
 %%
 %% Erlang to JavaScript type conversions:
 %% - integers/floats -> numbers
@@ -153,13 +159,30 @@ eval(Ctx, Code) ->
 %%
 %% Examples:
 %% ```
+%% %% With bindings
 %% {ok, 30} = duktape:eval(Ctx, <<"x * y">>, #{<<"x">> => 5, <<"y">> => 6}).
 %% {ok, <<"hello world">>} = duktape:eval(Ctx, <<"greeting + ' ' + name">>,
 %%                                        #{greeting => <<"hello">>, name => <<"world">>}).
+%% %% With timeout (milliseconds)
+%% {ok, 42} = duktape:eval(Ctx, <<"21 * 2">>, 5000).
+%% {error, timeout} = duktape:eval(Ctx, <<"while(true){}">>, 100).
 %% '''
--spec eval(context(), iodata(), bindings()) -> {ok, js_value()} | {error, term()}.
+-spec eval(context(), iodata(), bindings() | timeout()) -> {ok, js_value()} | {error, term()}.
+eval(Ctx, Code, Timeout) when is_integer(Timeout); Timeout =:= infinity ->
+    eval_loop(Ctx, nif_eval(Ctx, Code, timeout_to_ms(Timeout)));
 eval(Ctx, Code, Bindings) when is_map(Bindings) ->
-    eval_loop(Ctx, nif_eval_bindings(Ctx, Code, Bindings)).
+    eval(Ctx, Code, Bindings, ?DEFAULT_TIMEOUT).
+
+%% @doc Evaluate JavaScript code with variable bindings and timeout.
+%%
+%% Examples:
+%% ```
+%% {ok, 30} = duktape:eval(Ctx, <<"x * y">>, #{x => 5, y => 6}, 5000).
+%% {error, timeout} = duktape:eval(Ctx, <<"while(true){}">>, #{}, 100).
+%% '''
+-spec eval(context(), iodata(), bindings(), timeout()) -> {ok, js_value()} | {error, term()}.
+eval(Ctx, Code, Bindings, Timeout) when is_map(Bindings), (is_integer(Timeout) orelse Timeout =:= infinity) ->
+    eval_loop(Ctx, nif_eval_bindings(Ctx, Code, Bindings, timeout_to_ms(Timeout))).
 
 %% @doc Call a global JavaScript function with no arguments.
 %% Equivalent to call(Ctx, FunctionName, []).
@@ -173,18 +196,36 @@ eval(Ctx, Code, Bindings) when is_map(Bindings) ->
 call(Ctx, FunctionName) ->
     call(Ctx, FunctionName, []).
 
-%% @doc Call a global JavaScript function with arguments.
-%% The function must exist in the global scope.
+%% @doc Call a global JavaScript function with arguments or timeout.
+%%
+%% When the third argument is a list, it's treated as arguments.
+%% When the third argument is an integer or `infinity', it's treated as a timeout.
 %%
 %% Examples:
 %% ```
 %% {ok, _} = duktape:eval(Ctx, <<"function add(a, b) { return a + b; }">>).
 %% {ok, 7} = duktape:call(Ctx, <<"add">>, [3, 4]).
 %% {ok, 7} = duktape:call(Ctx, add, [3, 4]).
+%% %% With timeout
+%% {ok, 7} = duktape:call(Ctx, add, 5000).
 %% '''
--spec call(context(), iodata() | atom(), [term()]) -> {ok, js_value()} | {error, term()}.
+-spec call(context(), iodata() | atom(), [term()] | timeout()) -> {ok, js_value()} | {error, term()}.
+call(Ctx, FunctionName, Timeout) when is_integer(Timeout); Timeout =:= infinity ->
+    eval_loop(Ctx, nif_call(Ctx, FunctionName, [], timeout_to_ms(Timeout)));
 call(Ctx, FunctionName, Args) when is_list(Args) ->
-    eval_loop(Ctx, nif_call(Ctx, FunctionName, Args)).
+    call(Ctx, FunctionName, Args, ?DEFAULT_TIMEOUT).
+
+%% @doc Call a global JavaScript function with arguments and timeout.
+%%
+%% Examples:
+%% ```
+%% {ok, _} = duktape:eval(Ctx, <<"function add(a, b) { return a + b; }">>).
+%% {ok, 7} = duktape:call(Ctx, add, [3, 4], 5000).
+%% {error, timeout} = duktape:call(Ctx, infinite_loop, [], 100).
+%% '''
+-spec call(context(), iodata() | atom(), [term()], timeout()) -> {ok, js_value()} | {error, term()}.
+call(Ctx, FunctionName, Args, Timeout) when is_list(Args), (is_integer(Timeout) orelse Timeout =:= infinity) ->
+    eval_loop(Ctx, nif_call(Ctx, FunctionName, Args, timeout_to_ms(Timeout))).
 
 %% @doc Register a CommonJS module with source code.
 %% The module can then be loaded with require/2 or via require() in JavaScript.
@@ -348,6 +389,17 @@ register_function(Ctx, Name, {M, F}) when is_atom(M), is_atom(F) ->
     register_function(Ctx, Name, Fun).
 
 %% ============================================================================
+%% Internal: Timeout helper
+%% ============================================================================
+
+%% @private
+%% Convert timeout() to milliseconds for NIF.
+%% infinity -> 0 (means no timeout in NIF)
+-spec timeout_to_ms(timeout()) -> non_neg_integer().
+timeout_to_ms(infinity) -> 0;
+timeout_to_ms(Ms) when is_integer(Ms), Ms >= 0 -> Ms.
+
+%% ============================================================================
 %% Internal: Erlang function dispatch loop
 %% ============================================================================
 
@@ -410,9 +462,9 @@ nif_info() -> ?nif_stub.
 nif_new_context() -> ?nif_stub.
 nif_new_context_opts(_Opts) -> ?nif_stub.
 nif_destroy_context(_Ctx) -> ?nif_stub.
-nif_eval(_Ctx, _Code) -> ?nif_stub.
-nif_eval_bindings(_Ctx, _Code, _Bindings) -> ?nif_stub.
-nif_call(_Ctx, _FunctionName, _Args) -> ?nif_stub.
+nif_eval(_Ctx, _Code, _TimeoutMs) -> ?nif_stub.
+nif_eval_bindings(_Ctx, _Code, _Bindings, _TimeoutMs) -> ?nif_stub.
+nif_call(_Ctx, _FunctionName, _Args, _TimeoutMs) -> ?nif_stub.
 nif_register_module(_Ctx, _ModuleId, _Source) -> ?nif_stub.
 nif_require(_Ctx, _ModuleId) -> ?nif_stub.
 nif_send(_Ctx, _Event, _Data) -> ?nif_stub.

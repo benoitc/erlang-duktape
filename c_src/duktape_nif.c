@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include "erl_nif.h"
 #include "duktape.h"
 #include "duk_module_duktape.h"
@@ -102,6 +103,10 @@ typedef struct {
     /* Call indexing for nested calls */
     int call_index;             /* Current call index in eval sequence */
     int pending_index;          /* Index of the pending call */
+    /* Timeout support */
+    int timeout_enabled;        /* Whether timeout checking is active */
+    uint64_t timeout_ms;        /* Timeout in milliseconds */
+    uint64_t exec_start_ns;     /* Start time in nanoseconds (monotonic) */
 } duktape_ctx_t;
 
 /* ============================================================================
@@ -141,6 +146,51 @@ static ERL_NIF_TERM atom_alloc_count;
 static ERL_NIF_TERM atom_realloc_count;
 static ERL_NIF_TERM atom_free_count;
 static ERL_NIF_TERM atom_gc_runs;
+
+/* Timeout atom */
+static ERL_NIF_TERM atom_timeout;
+
+/* ============================================================================
+ * Timeout support
+ * ============================================================================ */
+
+/* Get monotonic time in nanoseconds */
+static uint64_t get_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/*
+ * Timeout check callback - called by Duktape's interrupt handler.
+ * Returns non-zero if execution should be aborted.
+ * This is called from duktape.c via DUK_USE_EXEC_TIMEOUT_CHECK macro.
+ */
+int duktape_check_timeout(void *udata) {
+    duktape_ctx_t *res = (duktape_ctx_t *)udata;
+    if (res == NULL || !res->timeout_enabled) {
+        return 0;
+    }
+
+    uint64_t elapsed_ms = (get_monotonic_ns() - res->exec_start_ns) / 1000000ULL;
+    return elapsed_ms > res->timeout_ms ? 1 : 0;
+}
+
+/* Start timeout timer for an execution */
+static void start_timeout(duktape_ctx_t *res, uint64_t timeout_ms) {
+    if (timeout_ms > 0 && timeout_ms != UINT64_MAX) {
+        res->timeout_enabled = 1;
+        res->timeout_ms = timeout_ms;
+        res->exec_start_ns = get_monotonic_ns();
+    } else {
+        res->timeout_enabled = 0;
+    }
+}
+
+/* Stop timeout timer */
+static void stop_timeout(duktape_ctx_t *res) {
+    res->timeout_enabled = 0;
+}
 
 /* ============================================================================
  * Custom memory allocator for metrics tracking
@@ -1004,6 +1054,11 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     res->call_index = 0;
     res->pending_index = 0;
 
+    /* Initialize timeout fields */
+    res->timeout_enabled = 0;
+    res->timeout_ms = 0;
+    res->exec_start_ns = 0;
+
     /* Create the mutex */
     res->lock = enif_mutex_create("duktape_ctx_lock");
     if (!res->lock) {
@@ -1123,6 +1178,11 @@ nif_new_context_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     res->resume_code_len = 0;
     res->call_index = 0;
     res->pending_index = 0;
+
+    /* Initialize timeout fields */
+    res->timeout_enabled = 0;
+    res->timeout_ms = 0;
+    res->exec_start_ns = 0;
 
     /* Parse options map */
     if (!enif_is_map(env, argv[0])) {
@@ -1498,6 +1558,13 @@ nif_eval_resume(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return enif_make_tuple2(env, atom_ok, result);
 }
 
+/* Check if error message indicates a timeout */
+static int is_timeout_error(const char *err_msg) {
+    if (err_msg == NULL) return 0;
+    /* Duktape throws RangeError with "execution timeout" message */
+    return strstr(err_msg, "execution timeout") != NULL;
+}
+
 /* Evaluate JavaScript code */
 static ERL_NIF_TERM
 nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -1507,6 +1574,7 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     duktape_ctx_t *res;
     ErlNifBinary js_code;
     ERL_NIF_TERM result;
+    uint64_t timeout_ms;
 
     /* Get the context */
     res = get_context(env, argv[0]);
@@ -1522,12 +1590,36 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         }
     }
 
+    /* Get timeout - either an integer or the atom 'infinity' */
+    if (enif_is_atom(env, argv[2])) {
+        /* Check if it's 'infinity' atom */
+        char atom_buf[16];
+        if (enif_get_atom(env, argv[2], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1) > 0) {
+            if (strcmp(atom_buf, "infinity") == 0) {
+                timeout_ms = 0;  /* 0 means no timeout */
+            } else {
+                return enif_make_tuple2(env, atom_error, atom_badarg);
+            }
+        } else {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    } else {
+        ErlNifUInt64 t;
+        if (!enif_get_uint64(env, argv[2], &t)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+        timeout_ms = (uint64_t)t;
+    }
+
     enif_mutex_lock(res->lock);
 
     if (res->destroyed || res->ctx == NULL) {
         enif_mutex_unlock(res->lock);
         return enif_make_tuple2(env, atom_error, atom_invalid_context);
     }
+
+    /* Start timeout if specified */
+    start_timeout(res, timeout_ms);
 
     /* Reset call index and clear results for fresh evaluation */
     res->call_index = 0;
@@ -1537,6 +1629,16 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     duk_push_lstring(res->ctx, (const char *)js_code.data, js_code.size);
 
     if (duk_peval(res->ctx) != 0) {
+        stop_timeout(res);
+
+        /* Check if this is a timeout error */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        if (is_timeout_error(err_msg)) {
+            duk_pop(res->ctx);
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_timeout);
+        }
+
         /* Check if this is a pending Erlang function call */
         if (res->pending_call) {
             /* Store the original code for resumption */
@@ -1562,7 +1664,6 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         }
 
         /* Regular error */
-        const char *err_msg = duk_safe_to_string(res->ctx, -1);
         size_t err_len = err_msg ? strlen(err_msg) : 0;
         ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
         duk_pop(res->ctx);  /* Pop error */
@@ -1571,6 +1672,8 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error,
             enif_make_tuple2(env, atom_js_error, err_bin));
     }
+
+    stop_timeout(res);
 
     /* Convert result to Erlang term */
     result = duk_to_erlang(env, res->ctx, -1);
@@ -1590,6 +1693,7 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     duktape_ctx_t *res;
     ErlNifBinary js_code;
     ERL_NIF_TERM result;
+    uint64_t timeout_ms;
 
     /* Get the context */
     res = get_context(env, argv[0]);
@@ -1609,6 +1713,26 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error, atom_badarg);
     }
 
+    /* Get timeout - either an integer or the atom 'infinity' */
+    if (enif_is_atom(env, argv[3])) {
+        char atom_buf[16];
+        if (enif_get_atom(env, argv[3], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1) > 0) {
+            if (strcmp(atom_buf, "infinity") == 0) {
+                timeout_ms = 0;
+            } else {
+                return enif_make_tuple2(env, atom_error, atom_badarg);
+            }
+        } else {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    } else {
+        ErlNifUInt64 t;
+        if (!enif_get_uint64(env, argv[3], &t)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+        timeout_ms = (uint64_t)t;
+    }
+
     enif_mutex_lock(res->lock);
 
     if (res->destroyed || res->ctx == NULL) {
@@ -1625,7 +1749,6 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     ERL_NIF_TERM key, value;
     while (enif_map_iterator_get_pair(env, &iter, &key, &value)) {
-        /* Get key as string for global variable name */
         char key_buf[256];
         ErlNifBinary key_bin;
         const char *var_name = NULL;
@@ -1646,19 +1769,19 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             return enif_make_tuple2(env, atom_error, atom_badarg);
         }
 
-        /* Convert value to Duktape and set as global */
         if (erlang_to_duk(env, res->ctx, value) != 0) {
             enif_map_iterator_destroy(env, &iter);
             enif_mutex_unlock(res->lock);
             return enif_make_tuple2(env, atom_error, atom_badarg);
         }
 
-        /* Set as global variable */
         duk_put_global_lstring(res->ctx, var_name, var_name_len);
-
         enif_map_iterator_next(env, &iter);
     }
     enif_map_iterator_destroy(env, &iter);
+
+    /* Start timeout if specified */
+    start_timeout(res, timeout_ms);
 
     /* Reset call index and clear results for fresh evaluation */
     res->call_index = 0;
@@ -1668,9 +1791,18 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     duk_push_lstring(res->ctx, (const char *)js_code.data, js_code.size);
 
     if (duk_peval(res->ctx) != 0) {
+        stop_timeout(res);
+
+        /* Check if this is a timeout error */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        if (is_timeout_error(err_msg)) {
+            duk_pop(res->ctx);
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_timeout);
+        }
+
         /* Check if this is a pending Erlang function call */
         if (res->pending_call) {
-            /* Store the original code for resumption */
             if (res->resume_code) {
                 enif_free(res->resume_code);
             }
@@ -1691,7 +1823,6 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             return enif_make_tuple3(env, atom_call_erlang, func_name, args);
         }
 
-        const char *err_msg = duk_safe_to_string(res->ctx, -1);
         size_t err_len = err_msg ? strlen(err_msg) : 0;
         ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
         duk_pop(res->ctx);
@@ -1700,6 +1831,8 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error,
             enif_make_tuple2(env, atom_js_error, err_bin));
     }
+
+    stop_timeout(res);
 
     /* Convert result to Erlang term */
     result = duk_to_erlang(env, res->ctx, -1);
@@ -1718,6 +1851,7 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     duktape_ctx_t *res;
     ERL_NIF_TERM result;
+    uint64_t timeout_ms;
 
     /* Get the context */
     res = get_context(env, argv[0]);
@@ -1752,6 +1886,26 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     unsigned int args_len;
     if (!enif_get_list_length(env, argv[2], &args_len)) {
         return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    /* Get timeout - either an integer or the atom 'infinity' */
+    if (enif_is_atom(env, argv[3])) {
+        char atom_buf[16];
+        if (enif_get_atom(env, argv[3], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1) > 0) {
+            if (strcmp(atom_buf, "infinity") == 0) {
+                timeout_ms = 0;
+            } else {
+                return enif_make_tuple2(env, atom_error, atom_badarg);
+            }
+        } else {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+    } else {
+        ErlNifUInt64 t;
+        if (!enif_get_uint64(env, argv[3], &t)) {
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+        timeout_ms = (uint64_t)t;
     }
 
     enif_mutex_lock(res->lock);
@@ -1794,7 +1948,7 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     unsigned int idx = 0;
     while (enif_get_list_cell(env, args_list, &head, &tail)) {
         if (erlang_to_duk(env, res->ctx, head) != 0) {
-            duk_pop_2(res->ctx);  /* Pop array and function */
+            duk_pop_2(res->ctx);
             enif_mutex_unlock(res->lock);
             return enif_make_tuple2(env, atom_error, atom_badarg);
         }
@@ -1817,11 +1971,23 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         args_list = tail;
     }
 
+    /* Start timeout if specified */
+    start_timeout(res, timeout_ms);
+
     /* Call the function */
     if (duk_pcall(res->ctx, (duk_idx_t)pushed_args) != 0) {
+        stop_timeout(res);
+
+        /* Check if this is a timeout error */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        if (is_timeout_error(err_msg)) {
+            duk_pop(res->ctx);
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_timeout);
+        }
+
         /* Check if this is a pending Erlang function call */
         if (res->pending_call) {
-            /* Store resume code for re-calling the function */
             const char *resume_str = "__call_func__.apply(null, __call_args__)";
             size_t resume_len = strlen(resume_str);
             if (res->resume_code) {
@@ -1844,7 +2010,6 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         }
 
         /* Regular error */
-        const char *err_msg = duk_safe_to_string(res->ctx, -1);
         size_t err_len = err_msg ? strlen(err_msg) : 0;
         ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
         duk_pop(res->ctx);
@@ -1853,6 +2018,8 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error,
             enif_make_tuple2(env, atom_js_error, err_bin));
     }
+
+    stop_timeout(res);
 
     /* Convert result to Erlang term */
     result = duk_to_erlang(env, res->ctx, -1);
@@ -2272,6 +2439,9 @@ on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     atom_free_count = enif_make_atom(env, "free_count");
     atom_gc_runs = enif_make_atom(env, "gc_runs");
 
+    /* Timeout atom */
+    atom_timeout = enif_make_atom(env, "timeout");
+
     return 0;
 }
 
@@ -2313,9 +2483,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_gc", 1, nif_gc, 0},
 
     /* CPU-bound operations - run on dirty scheduler */
-    {"nif_eval", 2, nif_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_eval_bindings", 3, nif_eval_bindings, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_call", 3, nif_call, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_eval", 3, nif_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_eval_bindings", 4, nif_eval_bindings, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_call", 4, nif_call, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_require", 2, nif_require, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_eval_resume", 1, nif_eval_resume, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_cbor_encode", 2, nif_cbor_encode, ERL_NIF_DIRTY_JOB_CPU_BOUND},

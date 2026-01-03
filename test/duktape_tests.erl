@@ -1744,3 +1744,95 @@ memory_stats_counts_test() ->
     %% Should have more allocations
     ?assert(AllocAfter > AllocBefore),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: Timeout support
+%% ============================================================================
+
+%% Test: eval with timeout - infinite loop should timeout
+timeout_eval_infinite_loop_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Infinite loop should timeout
+    Result = duktape:eval(Ctx, <<"while(true){}">>, 100),
+    ?assertMatch({error, timeout}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: eval with timeout - normal execution should succeed
+timeout_eval_normal_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Normal execution should complete within timeout
+    ?assertEqual({ok, 42}, duktape:eval(Ctx, <<"21 * 2">>, 5000)),
+    ?assertEqual({ok, <<"hello">>}, duktape:eval(Ctx, <<"'hello'">>, 1000)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: eval with bindings and timeout
+timeout_eval_bindings_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% With bindings and timeout
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"x * 2">>, #{x => 5}, 5000)),
+    ?assertEqual({ok, 15}, duktape:eval(Ctx, <<"x + y">>, #{x => 10, y => 5}, 1000)),
+    %% Infinite loop with bindings should timeout
+    ?assertMatch({error, timeout}, duktape:eval(Ctx, <<"while(true){}">>, #{}, 100)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: call with timeout - function call should work
+timeout_call_normal_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function add(a, b) { return a + b; }">>),
+    ?assertEqual({ok, 7}, duktape:call(Ctx, add, [3, 4], 5000)),
+    ?assertEqual({ok, 7}, duktape:call(Ctx, <<"add">>, [3, 4], 1000)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: call with timeout - infinite loop in function should timeout
+timeout_call_infinite_loop_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function infinite() { while(true){} }">>),
+    ?assertMatch({error, timeout}, duktape:call(Ctx, infinite, [], 100)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: infinity timeout means no timeout
+timeout_infinity_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% infinity should allow normal operations (we can't test actual infinity, just that it works)
+    ?assertEqual({ok, 100}, duktape:eval(Ctx, <<"50 + 50">>, infinity)),
+    ?assertEqual({ok, 25}, duktape:eval(Ctx, <<"x * y">>, #{x => 5, y => 5}, infinity)),
+    {ok, _} = duktape:eval(Ctx, <<"function mul(a, b) { return a * b; }">>),
+    ?assertEqual({ok, 20}, duktape:call(Ctx, mul, [4, 5], infinity)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: context remains usable after timeout
+timeout_context_reuse_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Set a value before timeout
+    {ok, _} = duktape:eval(Ctx, <<"var x = 10;">>),
+    %% Trigger timeout
+    ?assertMatch({error, timeout}, duktape:eval(Ctx, <<"while(true){}">>, 100)),
+    %% Context should still be usable and retain state
+    ?assertEqual({ok, 10}, duktape:eval(Ctx, <<"x">>)),
+    ?assertEqual({ok, 20}, duktape:eval(Ctx, <<"x * 2">>, 5000)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: call with just timeout (no args list)
+timeout_call_no_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, _} = duktape:eval(Ctx, <<"function getFortyTwo() { return 42; }">>),
+    %% call/3 with timeout instead of args
+    ?assertEqual({ok, 42}, duktape:call(Ctx, getFortyTwo, 5000)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: very short timeout
+timeout_very_short_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Even quick operations should succeed with short but reasonable timeout
+    ?assertEqual({ok, 1}, duktape:eval(Ctx, <<"1">>, 50)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: timeout with CPU-intensive but finite loop
+timeout_cpu_intensive_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% This loop is finite and should complete, but takes some CPU
+    Code = <<"var sum = 0; for (var i = 0; i < 100000; i++) sum += i; sum;">>,
+    %% With generous timeout, should succeed
+    Result = duktape:eval(Ctx, Code, 5000),
+    ?assertMatch({ok, _}, Result),
+    ok = duktape:destroy_context(Ctx).
