@@ -1,6 +1,6 @@
 # Duktape
 
-[![GitLab CI](https://gitlab.com/benoitc/erlang-duktape/badges/main/pipeline.svg)](https://gitlab.com/benoitc/erlang-duktape/-/pipelines)
+[![CI](https://github.com/benoitc/erlang-duktape/actions/workflows/ci.yml/badge.svg)](https://github.com/benoitc/erlang-duktape/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/duktape.svg)](https://hex.pm/packages/duktape)
 
 Duktape JavaScript engine for Erlang.
