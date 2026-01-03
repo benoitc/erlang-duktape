@@ -13,6 +13,7 @@ This library embeds the [Duktape](https://duktape.org/) JavaScript engine (v2.7.
 - Bidirectional type conversion between Erlang and JavaScript
 - Multiple isolated JavaScript contexts
 - CommonJS module support
+- **Execution timeouts to prevent infinite loops**
 - **Event framework for JS ↔ Erlang communication**
 - **Register Erlang functions callable from JavaScript**
 - **console.log/info/warn/error/debug support**
@@ -106,7 +107,7 @@ Explicitly destroy a JavaScript context. This is optional - contexts are automat
 
 #### `eval(Ctx, Code) -> {ok, Value} | {error, term()}`
 
-Evaluate JavaScript code and return the result of the last expression.
+Evaluate JavaScript code and return the result of the last expression. Uses default timeout of 5000ms.
 
 ```erlang
 {ok, 3} = duktape:eval(Ctx, <<"1 + 2">>).
@@ -114,35 +115,64 @@ Evaluate JavaScript code and return the result of the last expression.
 {error, {js_error, _}} = duktape:eval(Ctx, <<"throw 'oops'">>).
 ```
 
+#### `eval(Ctx, Code, Timeout) -> {ok, Value} | {error, term()}`
 #### `eval(Ctx, Code, Bindings) -> {ok, Value} | {error, term()}`
 
-Evaluate JavaScript code with variable bindings. Bindings are set as global variables before evaluation.
+With an integer or `infinity` as third argument, sets execution timeout in milliseconds. With a map, sets variable bindings.
 
 ```erlang
+%% With timeout (100ms)
+{error, timeout} = duktape:eval(Ctx, <<"while(true){}">>, 100).
+{ok, 42} = duktape:eval(Ctx, <<"21 * 2">>, 1000).
+{ok, 42} = duktape:eval(Ctx, <<"21 * 2">>, infinity).  %% No timeout
+
+%% With bindings (uses default 5000ms timeout)
 {ok, 30} = duktape:eval(Ctx, <<"x * y">>, #{x => 5, y => 6}).
-{ok, <<"hello world">>} = duktape:eval(Ctx, <<"greeting + ' ' + name">>,
-                                       #{greeting => <<"hello">>, name => <<"world">>}).
+```
+
+#### `eval(Ctx, Code, Bindings, Timeout) -> {ok, Value} | {error, term()}`
+
+Evaluate with both variable bindings and explicit timeout.
+
+```erlang
+{ok, 30} = duktape:eval(Ctx, <<"x * y">>, #{x => 5, y => 6}, 1000).
+{error, timeout} = duktape:eval(Ctx, <<"while(x){}">>, #{x => true}, 100).
 ```
 
 ### Function Calls
 
 #### `call(Ctx, FunctionName) -> {ok, Value} | {error, term()}`
 
-Call a global JavaScript function with no arguments.
+Call a global JavaScript function with no arguments. Uses default timeout of 5000ms.
 
 ```erlang
 {ok, _} = duktape:eval(Ctx, <<"function getTime() { return Date.now(); }">>).
 {ok, Timestamp} = duktape:call(Ctx, <<"getTime">>).
 ```
 
+#### `call(Ctx, FunctionName, Timeout) -> {ok, Value} | {error, term()}`
 #### `call(Ctx, FunctionName, Args) -> {ok, Value} | {error, term()}`
 
-Call a global JavaScript function with arguments. Function names can be binaries or atoms.
+With an integer or `infinity` as third argument, sets execution timeout. With a list, passes arguments to the function.
 
 ```erlang
+%% With timeout
+{ok, _} = duktape:eval(Ctx, <<"function slow() { while(true){} }">>).
+{error, timeout} = duktape:call(Ctx, slow, 100).
+
+%% With args (uses default 5000ms timeout)
 {ok, _} = duktape:eval(Ctx, <<"function add(a, b) { return a + b; }">>).
 {ok, 7} = duktape:call(Ctx, <<"add">>, [3, 4]).
 {ok, 7} = duktape:call(Ctx, add, [3, 4]).
+```
+
+#### `call(Ctx, FunctionName, Args, Timeout) -> {ok, Value} | {error, term()}`
+
+Call a function with both arguments and explicit timeout.
+
+```erlang
+{ok, 7} = duktape:call(Ctx, add, [3, 4], 1000).
+{ok, 7} = duktape:call(Ctx, add, [3, 4], infinity).  %% No timeout
 ```
 
 ### CommonJS Modules
@@ -516,13 +546,25 @@ Run benchmarks yourself:
 
 When running untrusted JavaScript code, be aware of these limitations:
 
-### Execution Limits
+### Execution Timeouts
 
-Duktape does not have built-in execution timeout. JavaScript code can:
-- Run infinite loops (blocks a dirty scheduler thread)
-- Allocate unbounded memory
+All `eval` and `call` functions support execution timeouts to prevent infinite loops:
 
-**Recommendation**: Only run trusted JavaScript, or implement application-level timeouts using Erlang's process monitoring.
+```erlang
+%% Default timeout is 5000ms
+{error, timeout} = duktape:eval(Ctx, <<"while(true){}">>, 100).
+
+%% Use infinity for no timeout (only for trusted code)
+{ok, _} = duktape:eval(Ctx, Code, infinity).
+```
+
+After a timeout, the context remains valid and can be reused for subsequent calls.
+
+### Memory Limits
+
+Duktape does not have built-in memory limits. JavaScript code can allocate unbounded memory.
+
+**Recommendation**: For untrusted code, monitor memory usage via `get_memory_stats/1` and destroy contexts that exceed limits.
 
 ### Event Types
 
