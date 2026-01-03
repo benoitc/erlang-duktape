@@ -472,7 +472,7 @@ bench_event_emit(_Opts) ->
     try
         {ok, _} = duktape:eval(Ctx, <<"Erlang.emit('test', {value: 42})">>),
         %% Drain the message
-        receive {duktape, test, _} -> ok after 100 -> ok end,
+        receive {duktape, <<"test">>, _} -> ok after 100 -> ok end,
         1
     after
         duktape:destroy_context(Ctx)
