@@ -73,6 +73,23 @@ typedef struct {
     ErlNifMutex *lock;          /* Mutex for thread safety */
     int ref_count;              /* Reference count */
     int destroyed;              /* Flag indicating context was explicitly destroyed */
+    /* Event handling */
+    ErlNifEnv *event_env;       /* Env for sending events to Erlang */
+    ErlNifPid handler_pid;      /* Handler process for events */
+    int handler_enabled;        /* Whether handler is set */
+    /* Pending Erlang function call (for trampoline pattern) */
+    int pending_call;           /* Flag: Erlang call pending */
+    char pending_func[256];     /* Function name being called */
+    ERL_NIF_TERM pending_args;  /* Arguments list for pending call */
+    ErlNifEnv *pending_env;     /* Env for pending call args */
+    ERL_NIF_TERM call_result;   /* Result from completed Erlang call */
+    int has_call_result;        /* Flag: result is available */
+    /* Original code for resumption */
+    char *resume_code;          /* Original JS code being evaluated */
+    size_t resume_code_len;     /* Length of resume_code */
+    /* Call indexing for nested calls */
+    int call_index;             /* Current call index in eval sequence */
+    int pending_index;          /* Index of the pending call */
 } duktape_ctx_t;
 
 /* ============================================================================
@@ -93,6 +110,17 @@ static ERL_NIF_TERM atom_enomem;
 static ERL_NIF_TERM atom_invalid_context;
 static ERL_NIF_TERM atom_badarg;
 static ERL_NIF_TERM atom_js_error;
+/* Event atoms */
+static ERL_NIF_TERM atom_duktape;
+static ERL_NIF_TERM atom_log;
+static ERL_NIF_TERM atom_debug;
+static ERL_NIF_TERM atom_info;
+static ERL_NIF_TERM atom_warning;
+static ERL_NIF_TERM atom_level;
+static ERL_NIF_TERM atom_message;
+static ERL_NIF_TERM atom_handler;
+/* Erlang function call atoms */
+static ERL_NIF_TERM atom_call_erlang;
 
 /* ============================================================================
  * Resource management
@@ -111,6 +139,24 @@ duktape_ctx_destructor(ErlNifEnv *env, void *obj)
         if (res->ctx && !res->destroyed) {
             duk_destroy_heap(res->ctx);
             res->ctx = NULL;
+        }
+
+        /* Clean up event environment */
+        if (res->event_env) {
+            enif_free_env(res->event_env);
+            res->event_env = NULL;
+        }
+
+        /* Clean up pending call environment */
+        if (res->pending_env) {
+            enif_free_env(res->pending_env);
+            res->pending_env = NULL;
+        }
+
+        /* Clean up resume code */
+        if (res->resume_code) {
+            enif_free(res->resume_code);
+            res->resume_code = NULL;
         }
 
         enif_mutex_unlock(res->lock);
@@ -492,6 +538,291 @@ mod_search(duk_context *ctx)
 }
 
 /* ============================================================================
+ * Event handling - JS to Erlang communication
+ * ============================================================================ */
+
+/*
+ * Send event to Erlang handler.
+ * Creates: {duktape, Type, Data}
+ */
+static void
+emit_event(duktape_ctx_t *res, ERL_NIF_TERM type, ERL_NIF_TERM data)
+{
+    if (!res->handler_enabled || !res->event_env) return;
+
+    ERL_NIF_TERM tuple = enif_make_tuple3(res->event_env,
+        atom_duktape, type, data);
+    enif_send(NULL, &res->handler_pid, res->event_env, tuple);
+    enif_clear_env(res->event_env);
+}
+
+/*
+ * Erlang.emit(type, data) - send event to Erlang
+ * type: string (event type)
+ * data: any JS value (converted to Erlang term)
+ */
+static duk_ret_t
+erlang_emit(duk_context *ctx)
+{
+    /* Get context from stash */
+    duk_push_global_stash(ctx);
+    duk_get_prop_string(ctx, -1, "duktape_ctx");
+    duktape_ctx_t *res = (duktape_ctx_t *)duk_get_pointer(ctx, -1);
+    duk_pop_2(ctx);
+
+    if (!res || !res->handler_enabled || !res->event_env) {
+        return 0;  /* No handler, silently ignore */
+    }
+
+    /* Get event type (string → atom) */
+    const char *type_str = duk_require_string(ctx, 0);
+    ERL_NIF_TERM type_atom = enif_make_atom(res->event_env, type_str);
+
+    /* Convert data to Erlang term */
+    ERL_NIF_TERM data = duk_to_erlang(res->event_env, ctx, 1);
+
+    emit_event(res, type_atom, data);
+
+    return 0;
+}
+
+/*
+ * Erlang.log(level, ...args) - convenience for logging
+ * Emits: {duktape, log, #{level => Level, message => Message}}
+ */
+static duk_ret_t
+erlang_log(duk_context *ctx)
+{
+    duk_push_global_stash(ctx);
+    duk_get_prop_string(ctx, -1, "duktape_ctx");
+    duktape_ctx_t *res = (duktape_ctx_t *)duk_get_pointer(ctx, -1);
+    duk_pop_2(ctx);
+
+    if (!res || !res->handler_enabled || !res->event_env) {
+        return 0;
+    }
+
+    /* Get level */
+    const char *level_str = duk_require_string(ctx, 0);
+    ERL_NIF_TERM level_atom;
+    if (strcmp(level_str, "debug") == 0) level_atom = atom_debug;
+    else if (strcmp(level_str, "info") == 0) level_atom = atom_info;
+    else if (strcmp(level_str, "warning") == 0) level_atom = atom_warning;
+    else if (strcmp(level_str, "error") == 0) level_atom = atom_error;
+    else level_atom = enif_make_atom(res->event_env, level_str);
+
+    /* Build message from remaining args */
+    int nargs = duk_get_top(ctx);
+    if (nargs > 1) {
+        duk_push_string(ctx, "");
+        for (int i = 1; i < nargs; i++) {
+            if (i > 1) duk_push_string(ctx, " ");
+            duk_dup(ctx, i);
+            duk_safe_to_string(ctx, -1);
+        }
+        duk_concat(ctx, (nargs - 1) * 2 - 1);
+    } else {
+        duk_push_string(ctx, "");
+    }
+
+    duk_size_t msg_len;
+    const char *msg = duk_get_lstring(ctx, -1, &msg_len);
+
+    /* Create message binary */
+    ERL_NIF_TERM msg_bin = make_binary_from_string(res->event_env, msg, msg_len, atom_enomem);
+
+    /* Create data map: #{level => atom, message => binary} */
+    ERL_NIF_TERM keys[2];
+    ERL_NIF_TERM vals[2];
+    keys[0] = atom_level;
+    keys[1] = atom_message;
+    vals[0] = level_atom;
+    vals[1] = msg_bin;
+    ERL_NIF_TERM data;
+    enif_make_map_from_arrays(res->event_env, keys, vals, 2, &data);
+
+    emit_event(res, atom_log, data);
+    duk_pop(ctx);
+
+    return 0;
+}
+
+/*
+ * Erlang.on(event, callback) - register callback for event
+ */
+static duk_ret_t
+erlang_on(duk_context *ctx)
+{
+    const char *event = duk_require_string(ctx, 0);
+    if (!duk_is_function(ctx, 1)) {
+        return duk_type_error(ctx, "callback must be a function");
+    }
+
+    /* Store callback: Erlang._callbacks[event] = fn */
+    duk_get_global_string(ctx, "Erlang");
+    duk_get_prop_string(ctx, -1, "_callbacks");
+    duk_dup(ctx, 1);  /* callback function */
+    duk_put_prop_string(ctx, -2, event);
+    duk_pop_2(ctx);
+
+    return 0;
+}
+
+/*
+ * Erlang.off(event) - unregister callback for event
+ */
+static duk_ret_t
+erlang_off(duk_context *ctx)
+{
+    const char *event = duk_require_string(ctx, 0);
+
+    duk_get_global_string(ctx, "Erlang");
+    duk_get_prop_string(ctx, -1, "_callbacks");
+    duk_del_prop_string(ctx, -1, event);
+    duk_pop_2(ctx);
+
+    return 0;
+}
+
+/* ============================================================================
+ * Erlang function trampoline - for JS calling Erlang functions
+ * ============================================================================ */
+
+/*
+ * Called when JavaScript invokes a registered Erlang function.
+ * This C function:
+ * 1. First checks if there's a cached result available (for resumed execution)
+ * 2. If not, stores the function name and arguments in the context
+ * 3. Throws an error to unwind the JS stack
+ * 4. nif_eval will catch this and return {call_erlang, Name, Args} to Erlang
+ */
+static duk_ret_t
+erlang_function_trampoline(duk_context *ctx)
+{
+    /* Get function name from current function's _erlang_name property */
+    duk_push_current_function(ctx);
+    duk_get_prop_string(ctx, -1, "_erlang_name");
+    const char *func_name = duk_require_string(ctx, -1);
+    duk_pop_2(ctx);
+
+    /* Get context from stash */
+    duk_push_global_stash(ctx);
+    duk_get_prop_string(ctx, -1, "duktape_ctx");
+    duktape_ctx_t *res = (duktape_ctx_t *)duk_get_pointer(ctx, -1);
+    duk_pop_2(ctx);
+
+    if (!res) {
+        return duk_type_error(ctx, "internal error: context not found");
+    }
+
+    /* Check if there's a cached result for this specific call index */
+    /* Results are stored in __erlang_results__ object keyed by call index */
+    int current_index = res->call_index;
+    res->call_index++;  /* Increment for next call */
+
+    duk_get_global_string(ctx, "__erlang_results__");
+    if (duk_is_object(ctx, -1)) {
+        duk_get_prop_index(ctx, -1, (duk_uarridx_t)current_index);
+        if (!duk_is_undefined(ctx, -1)) {
+            /* Found cached result for this call index */
+            /* Check if it's an error marker */
+            if (duk_is_string(ctx, -1)) {
+                const char *str = duk_get_string(ctx, -1);
+                if (str && strncmp(str, "__ERROR__:", 10) == 0) {
+                    /* It's an error - throw it */
+                    const char *err_msg = str + 10;
+                    duk_pop_2(ctx);  /* Pop string and object */
+                    return duk_error(ctx, DUK_ERR_ERROR, "error: %s", err_msg);
+                }
+            }
+            duk_remove(ctx, -2);  /* Remove the object, keep the result */
+            return 1;  /* Return the cached result */
+        }
+        duk_pop(ctx);  /* Pop undefined */
+    }
+    duk_pop(ctx);  /* Pop the object */
+
+    /* No cached result - set up pending call and throw */
+    res->pending_call = 1;
+    res->pending_index = current_index;
+    strncpy(res->pending_func, func_name, sizeof(res->pending_func) - 1);
+    res->pending_func[sizeof(res->pending_func) - 1] = '\0';
+
+    /* Clear the pending env and convert all arguments to an Erlang list */
+    enif_clear_env(res->pending_env);
+
+    int nargs = duk_get_top(ctx);
+    ERL_NIF_TERM *arg_terms = NULL;
+
+    if (nargs > 0) {
+        arg_terms = enif_alloc(sizeof(ERL_NIF_TERM) * nargs);
+        if (!arg_terms) {
+            res->pending_call = 0;
+            return duk_error(ctx, DUK_ERR_ERROR, "out of memory");
+        }
+
+        for (int i = 0; i < nargs; i++) {
+            arg_terms[i] = duk_to_erlang(res->pending_env, ctx, i);
+        }
+
+        res->pending_args = enif_make_list_from_array(res->pending_env, arg_terms, (unsigned int)nargs);
+        enif_free(arg_terms);
+    } else {
+        res->pending_args = enif_make_list(res->pending_env, 0);
+    }
+
+    /* Throw special error to unwind - will be caught by nif_eval */
+    return duk_error(ctx, DUK_ERR_ERROR, "__ERLANG_CALL__");
+}
+
+/*
+ * Initialize Erlang global object and console wrapper
+ */
+static void
+init_erlang_object(duk_context *ctx)
+{
+    /* Create Erlang global object */
+    duk_push_object(ctx);
+
+    /* Erlang.emit(type, data) */
+    duk_push_c_function(ctx, erlang_emit, 2);
+    duk_put_prop_string(ctx, -2, "emit");
+
+    /* Erlang.log(level, ...args) */
+    duk_push_c_function(ctx, erlang_log, DUK_VARARGS);
+    duk_put_prop_string(ctx, -2, "log");
+
+    /* Erlang.on(event, callback) */
+    duk_push_c_function(ctx, erlang_on, 2);
+    duk_put_prop_string(ctx, -2, "on");
+
+    /* Erlang.off(event) */
+    duk_push_c_function(ctx, erlang_off, 1);
+    duk_put_prop_string(ctx, -2, "off");
+
+    /* Erlang._callbacks = {} for storing registered callbacks */
+    duk_push_object(ctx);
+    duk_put_prop_string(ctx, -2, "_callbacks");
+
+    duk_put_global_string(ctx, "Erlang");
+
+    /* Create console object using JavaScript */
+    duk_eval_string_noresult(ctx,
+        "var console = {"
+        "  log:   function() { Erlang.log.apply(null, ['info'].concat(Array.prototype.slice.call(arguments))); },"
+        "  info:  function() { Erlang.log.apply(null, ['info'].concat(Array.prototype.slice.call(arguments))); },"
+        "  warn:  function() { Erlang.log.apply(null, ['warning'].concat(Array.prototype.slice.call(arguments))); },"
+        "  error: function() { Erlang.log.apply(null, ['error'].concat(Array.prototype.slice.call(arguments))); },"
+        "  debug: function() { Erlang.log.apply(null, ['debug'].concat(Array.prototype.slice.call(arguments))); }"
+        "};"
+    );
+
+    /* Initialize the results object for Erlang function call trampoline */
+    /* Uses an object keyed by call index for proper nested call support */
+    duk_eval_string_noresult(ctx, "var __erlang_results__ = {};");
+}
+
+/* ============================================================================
  * NIF functions
  * ============================================================================ */
 
@@ -513,6 +844,17 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     res->lock = NULL;
     res->ref_count = 1;
     res->destroyed = 0;
+    res->event_env = NULL;
+    res->handler_enabled = 0;
+    /* Initialize pending call fields */
+    res->pending_call = 0;
+    res->pending_func[0] = '\0';
+    res->pending_env = NULL;
+    res->has_call_result = 0;
+    res->resume_code = NULL;
+    res->resume_code_len = 0;
+    res->call_index = 0;
+    res->pending_index = 0;
 
     /* Create the mutex */
     res->lock = enif_mutex_create("duktape_ctx_lock");
@@ -526,6 +868,15 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (!res->ctx) {
         enif_mutex_destroy(res->lock);
         res->lock = NULL;
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    /* Allocate environment for pending call args */
+    res->pending_env = enif_alloc_env();
+    if (!res->pending_env) {
+        duk_destroy_heap(res->ctx);
+        enif_mutex_destroy(res->lock);
         enif_release_resource(res);
         return enif_make_tuple2(env, atom_error, atom_enomem);
     }
@@ -544,6 +895,15 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     duk_push_object(res->ctx);
     duk_put_prop_string(res->ctx, -2, MODULE_STASH_KEY);
     duk_pop(res->ctx);
+
+    /* Store context pointer in stash for JS callbacks */
+    duk_push_global_stash(res->ctx);
+    duk_push_pointer(res->ctx, (void *)res);
+    duk_put_prop_string(res->ctx, -2, "duktape_ctx");
+    duk_pop(res->ctx);
+
+    /* Initialize Erlang global object and console wrapper */
+    init_erlang_object(res->ctx);
 
     /* Create the resource term */
     ERL_NIF_TERM res_term = enif_make_resource(env, res);
@@ -584,6 +944,408 @@ nif_destroy_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return atom_ok;
 }
 
+/* Create a new Duktape context with options */
+static ERL_NIF_TERM
+nif_new_context_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    /* Allocate the resource */
+    duktape_ctx_t *res = enif_alloc_resource(duktape_ctx_resource, sizeof(duktape_ctx_t));
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    /* Initialize the structure */
+    res->ctx = NULL;
+    res->lock = NULL;
+    res->ref_count = 1;
+    res->destroyed = 0;
+    res->event_env = NULL;
+    res->handler_enabled = 0;
+    /* Initialize pending call fields */
+    res->pending_call = 0;
+    res->pending_func[0] = '\0';
+    res->pending_env = NULL;
+    res->has_call_result = 0;
+    res->resume_code = NULL;
+    res->resume_code_len = 0;
+    res->call_index = 0;
+    res->pending_index = 0;
+
+    /* Parse options map */
+    if (!enif_is_map(env, argv[0])) {
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    /* Check for handler option */
+    ERL_NIF_TERM handler_term;
+    if (enif_get_map_value(env, argv[0], atom_handler, &handler_term)) {
+        ErlNifPid handler_pid;
+        if (enif_get_local_pid(env, handler_term, &handler_pid)) {
+            res->handler_enabled = 1;
+            res->handler_pid = handler_pid;
+            res->event_env = enif_alloc_env();
+        }
+    }
+
+    /* Create the mutex */
+    res->lock = enif_mutex_create("duktape_ctx_lock");
+    if (!res->lock) {
+        if (res->event_env) enif_free_env(res->event_env);
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    /* Create the Duktape heap */
+    res->ctx = duk_create_heap_default();
+    if (!res->ctx) {
+        enif_mutex_destroy(res->lock);
+        res->lock = NULL;
+        if (res->event_env) enif_free_env(res->event_env);
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    /* Allocate environment for pending call args */
+    res->pending_env = enif_alloc_env();
+    if (!res->pending_env) {
+        duk_destroy_heap(res->ctx);
+        enif_mutex_destroy(res->lock);
+        if (res->event_env) enif_free_env(res->event_env);
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error, atom_enomem);
+    }
+
+    /* Initialize CommonJS module system */
+    duk_module_duktape_init(res->ctx);
+
+    /* Set up the modSearch callback */
+    duk_get_global_string(res->ctx, "Duktape");
+    duk_push_c_function(res->ctx, mod_search, 4 /*nargs*/);
+    duk_put_prop_string(res->ctx, -2, "modSearch");
+    duk_pop(res->ctx);
+
+    /* Initialize the module stash */
+    duk_push_global_stash(res->ctx);
+    duk_push_object(res->ctx);
+    duk_put_prop_string(res->ctx, -2, MODULE_STASH_KEY);
+    duk_pop(res->ctx);
+
+    /* Store context pointer in stash for JS callbacks */
+    duk_push_global_stash(res->ctx);
+    duk_push_pointer(res->ctx, (void *)res);
+    duk_put_prop_string(res->ctx, -2, "duktape_ctx");
+    duk_pop(res->ctx);
+
+    /* Initialize Erlang global object and console wrapper */
+    init_erlang_object(res->ctx);
+
+    /* Create the resource term */
+    ERL_NIF_TERM res_term = enif_make_resource(env, res);
+
+    /* Release our reference (the term now holds a reference) */
+    enif_release_resource(res);
+
+    return enif_make_tuple2(env, atom_ok, res_term);
+}
+
+/* Send data to a registered JavaScript callback */
+static ERL_NIF_TERM
+nif_send(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+    ERL_NIF_TERM result;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the event name */
+    char event_buf[256];
+    ErlNifBinary event_bin;
+    const char *event_name = NULL;
+    size_t event_len = 0;
+
+    if (enif_get_atom(env, argv[1], event_buf, sizeof(event_buf), ERL_NIF_LATIN1) > 0) {
+        event_name = event_buf;
+        event_len = strlen(event_buf);
+    } else if (enif_inspect_binary(env, argv[1], &event_bin)) {
+        event_name = (const char *)event_bin.data;
+        event_len = event_bin.size;
+    } else if (enif_inspect_iolist_as_binary(env, argv[1], &event_bin)) {
+        event_name = (const char *)event_bin.data;
+        event_len = event_bin.size;
+    } else {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get callback from Erlang._callbacks[event] */
+    duk_get_global_string(res->ctx, "Erlang");
+    duk_get_prop_string(res->ctx, -1, "_callbacks");
+    duk_get_prop_lstring(res->ctx, -1, event_name, event_len);
+
+    if (!duk_is_function(res->ctx, -1)) {
+        /* No callback registered for this event */
+        duk_pop_3(res->ctx);
+        enif_mutex_unlock(res->lock);
+        return atom_ok;  /* Silently succeed if no callback */
+    }
+
+    /* Push data argument */
+    if (erlang_to_duk(env, res->ctx, argv[2]) != 0) {
+        duk_pop_3(res->ctx);
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    /* Call the callback */
+    if (duk_pcall(res->ctx, 1) != 0) {
+        /* Error occurred */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
+        duk_pop_3(res->ctx);
+        enif_mutex_unlock(res->lock);
+
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_bin));
+    }
+
+    /* Convert result to Erlang term */
+    result = duk_to_erlang(env, res->ctx, -1);
+    duk_pop_3(res->ctx);  /* Pop result, _callbacks, Erlang */
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
+/* Register an Erlang function callable from JavaScript */
+static ERL_NIF_TERM
+nif_register_erlang_function(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Get the function name */
+    char name_buf[256];
+    ErlNifBinary name_bin;
+    const char *func_name = NULL;
+    size_t func_name_len = 0;
+
+    if (enif_get_atom(env, argv[1], name_buf, sizeof(name_buf), ERL_NIF_LATIN1) > 0) {
+        func_name = name_buf;
+        func_name_len = strlen(name_buf);
+    } else if (enif_inspect_binary(env, argv[1], &name_bin)) {
+        func_name = (const char *)name_bin.data;
+        func_name_len = name_bin.size;
+    } else if (enif_inspect_iolist_as_binary(env, argv[1], &name_bin)) {
+        func_name = (const char *)name_bin.data;
+        func_name_len = name_bin.size;
+    } else {
+        return enif_make_tuple2(env, atom_error, atom_badarg);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Create JS function with the trampoline, storing name as property */
+    duk_push_c_function(res->ctx, erlang_function_trampoline, DUK_VARARGS);
+    duk_push_lstring(res->ctx, func_name, func_name_len);
+    duk_put_prop_string(res->ctx, -2, "_erlang_name");
+    duk_put_global_lstring(res->ctx, func_name, func_name_len);
+
+    enif_mutex_unlock(res->lock);
+    return atom_ok;
+}
+
+/* Set the result of an Erlang function call (for trampoline pattern) */
+static ERL_NIF_TERM
+nif_call_complete(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Check if the result is an error tuple {error, Reason} */
+    int arity;
+    const ERL_NIF_TERM *tuple_elements;
+    int is_error = 0;
+    if (enif_get_tuple(env, argv[1], &arity, &tuple_elements) &&
+        arity == 2 && enif_is_atom(env, tuple_elements[0])) {
+        char atom_buf[32];
+        if (enif_get_atom(env, tuple_elements[0], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1) > 0 &&
+            strcmp(atom_buf, "error") == 0) {
+            is_error = 1;
+        }
+    }
+
+    if (is_error) {
+        /* Store as error - will be handled in resume */
+        enif_clear_env(res->pending_env);
+        res->call_result = enif_make_copy(res->pending_env, argv[1]);
+        res->has_call_result = 1;
+    } else {
+        /* Convert result to Duktape value */
+        if (erlang_to_duk(env, res->ctx, argv[1]) != 0) {
+            duk_push_undefined(res->ctx);
+        }
+
+        /* Store at __erlang_results__[pending_index] for indexed retrieval */
+        duk_get_global_string(res->ctx, "__erlang_results__");
+        duk_dup(res->ctx, -2);  /* Duplicate the result */
+        duk_put_prop_index(res->ctx, -2, (duk_uarridx_t)res->pending_index);
+        duk_pop_2(res->ctx);    /* Pop: object and original result */
+
+        res->has_call_result = 0;  /* Result is in the JS object now */
+    }
+
+    enif_mutex_unlock(res->lock);
+    return atom_ok;
+}
+
+/* Resume evaluation after Erlang function call completed */
+static ERL_NIF_TERM
+nif_eval_resume(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+    ERL_NIF_TERM result;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed || res->ctx == NULL) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Check if we have stored code to resume */
+    if (!res->resume_code || res->resume_code_len == 0) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error,
+            enif_make_atom(env, "no_resume_code"));
+    }
+
+    /* Handle error result from Erlang call */
+    if (res->has_call_result) {
+        int arity;
+        const ERL_NIF_TERM *tuple_elements;
+        if (enif_get_tuple(res->pending_env, res->call_result, &arity, &tuple_elements) &&
+            arity == 2 && enif_is_atom(res->pending_env, tuple_elements[0])) {
+            char atom_buf[32];
+            if (enif_get_atom(res->pending_env, tuple_elements[0], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1) > 0 &&
+                strcmp(atom_buf, "error") == 0) {
+                /* It's an error - store it so the trampoline can throw it */
+                res->has_call_result = 0;
+
+                /* Convert error reason to string for JS Error */
+                if (erlang_to_duk(res->pending_env, res->ctx, tuple_elements[1]) != 0) {
+                    duk_push_string(res->ctx, "unknown error");
+                }
+                const char *err_str = duk_safe_to_string(res->ctx, -1);
+
+                /* Store error at the pending index so trampoline throws it */
+                duk_get_global_string(res->ctx, "__erlang_results__");
+                duk_push_sprintf(res->ctx, "__ERROR__:%s", err_str);
+                duk_put_prop_index(res->ctx, -2, (duk_uarridx_t)res->pending_index);
+                duk_pop_2(res->ctx);  /* Pop object and error string */
+            }
+        }
+    }
+
+    /* Reset call index for re-evaluation */
+    res->call_index = 0;
+
+    /* Re-evaluate the original code - trampoline will retrieve cached results */
+    duk_push_lstring(res->ctx, res->resume_code, res->resume_code_len);
+
+    if (duk_peval(res->ctx) != 0) {
+        /* Check if this is another pending Erlang function call */
+        if (res->pending_call) {
+            ERL_NIF_TERM func_name = enif_make_atom(env, res->pending_func);
+            ERL_NIF_TERM args = enif_make_copy(env, res->pending_args);
+            res->pending_call = 0;
+
+            duk_pop(res->ctx);  /* Pop the error */
+            enif_mutex_unlock(res->lock);
+
+            return enif_make_tuple3(env, atom_call_erlang, func_name, args);
+        }
+
+        /* Check if this is an error from a failed Erlang function */
+        const char *err_msg = duk_safe_to_string(res->ctx, -1);
+        size_t err_len = err_msg ? strlen(err_msg) : 0;
+        ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
+        duk_pop(res->ctx);
+
+        /* Clean up resume code on completion */
+        enif_free(res->resume_code);
+        res->resume_code = NULL;
+        res->resume_code_len = 0;
+
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error,
+            enif_make_tuple2(env, atom_js_error, err_bin));
+    }
+
+    /* Success - get the result */
+    result = duk_to_erlang(env, res->ctx, -1);
+    duk_pop(res->ctx);
+
+    /* Clean up resume code on completion */
+    enif_free(res->resume_code);
+    res->resume_code = NULL;
+    res->resume_code_len = 0;
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, result);
+}
+
 /* Evaluate JavaScript code */
 static ERL_NIF_TERM
 nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -615,11 +1377,39 @@ nif_eval(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error, atom_invalid_context);
     }
 
+    /* Reset call index and clear results for fresh evaluation */
+    res->call_index = 0;
+    duk_eval_string_noresult(res->ctx, "__erlang_results__ = {};");
+
     /* Push the code as a string and evaluate */
     duk_push_lstring(res->ctx, (const char *)js_code.data, js_code.size);
 
     if (duk_peval(res->ctx) != 0) {
-        /* Error occurred */
+        /* Check if this is a pending Erlang function call */
+        if (res->pending_call) {
+            /* Store the original code for resumption */
+            if (res->resume_code) {
+                enif_free(res->resume_code);
+            }
+            res->resume_code = enif_alloc(js_code.size + 1);
+            if (res->resume_code) {
+                memcpy(res->resume_code, js_code.data, js_code.size);
+                res->resume_code[js_code.size] = '\0';
+                res->resume_code_len = js_code.size;
+            }
+
+            /* Copy pending call info to return to Erlang */
+            ERL_NIF_TERM func_name = enif_make_atom(env, res->pending_func);
+            ERL_NIF_TERM args = enif_make_copy(env, res->pending_args);
+            res->pending_call = 0;
+
+            duk_pop(res->ctx);  /* Pop the error */
+            enif_mutex_unlock(res->lock);
+
+            return enif_make_tuple3(env, atom_call_erlang, func_name, args);
+        }
+
+        /* Regular error */
         const char *err_msg = duk_safe_to_string(res->ctx, -1);
         size_t err_len = err_msg ? strlen(err_msg) : 0;
         ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
@@ -718,10 +1508,37 @@ nif_eval_bindings(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     }
     enif_map_iterator_destroy(env, &iter);
 
+    /* Reset call index and clear results for fresh evaluation */
+    res->call_index = 0;
+    duk_eval_string_noresult(res->ctx, "__erlang_results__ = {};");
+
     /* Evaluate the code */
     duk_push_lstring(res->ctx, (const char *)js_code.data, js_code.size);
 
     if (duk_peval(res->ctx) != 0) {
+        /* Check if this is a pending Erlang function call */
+        if (res->pending_call) {
+            /* Store the original code for resumption */
+            if (res->resume_code) {
+                enif_free(res->resume_code);
+            }
+            res->resume_code = enif_alloc(js_code.size + 1);
+            if (res->resume_code) {
+                memcpy(res->resume_code, js_code.data, js_code.size);
+                res->resume_code[js_code.size] = '\0';
+                res->resume_code_len = js_code.size;
+            }
+
+            ERL_NIF_TERM func_name = enif_make_atom(env, res->pending_func);
+            ERL_NIF_TERM args = enif_make_copy(env, res->pending_args);
+            res->pending_call = 0;
+
+            duk_pop(res->ctx);
+            enif_mutex_unlock(res->lock);
+
+            return enif_make_tuple3(env, atom_call_erlang, func_name, args);
+        }
+
         const char *err_msg = duk_safe_to_string(res->ctx, -1);
         size_t err_len = err_msg ? strlen(err_msg) : 0;
         ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
@@ -810,14 +1627,36 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             enif_make_tuple2(env, atom_js_error, err_msg));
     }
 
-    /* Push arguments onto the stack */
+    /* Reset call index and clear results for fresh call */
+    res->call_index = 0;
+    duk_eval_string_noresult(res->ctx, "__erlang_results__ = {};");
+
+    /* Store function for potential resume */
+    duk_dup(res->ctx, -1);
+    duk_put_global_string(res->ctx, "__call_func__");
+
+    /* Build __call_args__ array for potential resume */
+    duk_push_array(res->ctx);
     ERL_NIF_TERM args_list = argv[2];
     ERL_NIF_TERM head, tail;
-    unsigned int pushed_args = 0;
-
+    unsigned int idx = 0;
     while (enif_get_list_cell(env, args_list, &head, &tail)) {
         if (erlang_to_duk(env, res->ctx, head) != 0) {
-            /* Pop function and any pushed arguments */
+            duk_pop_2(res->ctx);  /* Pop array and function */
+            enif_mutex_unlock(res->lock);
+            return enif_make_tuple2(env, atom_error, atom_badarg);
+        }
+        duk_put_prop_index(res->ctx, -2, idx);
+        idx++;
+        args_list = tail;
+    }
+    duk_put_global_string(res->ctx, "__call_args__");
+
+    /* Push arguments for the actual call */
+    args_list = argv[2];
+    unsigned int pushed_args = 0;
+    while (enif_get_list_cell(env, args_list, &head, &tail)) {
+        if (erlang_to_duk(env, res->ctx, head) != 0) {
             duk_pop_n(res->ctx, (duk_idx_t)(pushed_args + 1));
             enif_mutex_unlock(res->lock);
             return enif_make_tuple2(env, atom_error, atom_badarg);
@@ -828,7 +1667,31 @@ nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     /* Call the function */
     if (duk_pcall(res->ctx, (duk_idx_t)pushed_args) != 0) {
-        /* Error occurred */
+        /* Check if this is a pending Erlang function call */
+        if (res->pending_call) {
+            /* Store resume code for re-calling the function */
+            const char *resume_str = "__call_func__.apply(null, __call_args__)";
+            size_t resume_len = strlen(resume_str);
+            if (res->resume_code) {
+                enif_free(res->resume_code);
+            }
+            res->resume_code = enif_alloc(resume_len + 1);
+            if (res->resume_code) {
+                memcpy(res->resume_code, resume_str, resume_len + 1);
+                res->resume_code_len = resume_len;
+            }
+
+            ERL_NIF_TERM erl_func_name = enif_make_atom(env, res->pending_func);
+            ERL_NIF_TERM erl_args = enif_make_copy(env, res->pending_args);
+            res->pending_call = 0;
+
+            duk_pop(res->ctx);
+            enif_mutex_unlock(res->lock);
+
+            return enif_make_tuple3(env, atom_call_erlang, erl_func_name, erl_args);
+        }
+
+        /* Regular error */
         const char *err_msg = duk_safe_to_string(res->ctx, -1);
         size_t err_len = err_msg ? strlen(err_msg) : 0;
         ERL_NIF_TERM err_bin = make_binary_from_string(env, err_msg, err_len, atom_enomem);
@@ -1018,6 +1881,17 @@ on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     atom_invalid_context = enif_make_atom(env, "invalid_context");
     atom_badarg = enif_make_atom(env, "badarg");
     atom_js_error = enif_make_atom(env, "js_error");
+    /* Event atoms */
+    atom_duktape = enif_make_atom(env, "duktape");
+    atom_log = enif_make_atom(env, "log");
+    atom_debug = enif_make_atom(env, "debug");
+    atom_info = enif_make_atom(env, "info");
+    atom_warning = enif_make_atom(env, "warning");
+    atom_level = enif_make_atom(env, "level");
+    atom_message = enif_make_atom(env, "message");
+    atom_handler = enif_make_atom(env, "handler");
+    /* Erlang function call atoms */
+    atom_call_erlang = enif_make_atom(env, "call_erlang");
 
     return 0;
 }
@@ -1043,12 +1917,17 @@ on_unload(ErlNifEnv *env, void *priv_data)
 static ErlNifFunc nif_funcs[] = {
     {"nif_info", 0, nif_info, 0},
     {"nif_new_context", 0, nif_new_context, 0},
+    {"nif_new_context_opts", 1, nif_new_context_opts, 0},
     {"nif_destroy_context", 1, nif_destroy_context, 0},
     {"nif_eval", 2, nif_eval, 0},
     {"nif_eval_bindings", 3, nif_eval_bindings, 0},
     {"nif_call", 3, nif_call, 0},
     {"nif_register_module", 3, nif_register_module, 0},
-    {"nif_require", 2, nif_require, 0}
+    {"nif_require", 2, nif_require, 0},
+    {"nif_send", 3, nif_send, 0},
+    {"nif_register_erlang_function", 2, nif_register_erlang_function, 0},
+    {"nif_call_complete", 2, nif_call_complete, 0},
+    {"nif_eval_resume", 1, nif_eval_resume, 0}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)

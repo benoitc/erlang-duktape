@@ -1066,3 +1066,372 @@ call_recursive_test() ->
     ?assertEqual({ok, 120}, duktape:call(Ctx, <<"factorial">>, [5])),
     ?assertEqual({ok, 3628800}, duktape:call(Ctx, <<"factorial">>, [10])),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: Event Framework - JS to Erlang communication
+%% ============================================================================
+
+%% Test: console.log sends event to handler
+console_log_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"console.log('hello', 'world')">>),
+    receive
+        {duktape, log, #{level := info, message := Msg}} ->
+            ?assertEqual(<<"hello world">>, Msg)
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: console.info sends info level
+console_info_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"console.info('info message')">>),
+    receive
+        {duktape, log, #{level := info, message := <<"info message">>}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: console.warn sends warning level
+console_warn_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"console.warn('warning message')">>),
+    receive
+        {duktape, log, #{level := warning, message := <<"warning message">>}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: console.error sends error level
+console_error_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"console.error('error message')">>),
+    receive
+        {duktape, log, #{level := error, message := <<"error message">>}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: console.debug sends debug level
+console_debug_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"console.debug('debug message')">>),
+    receive
+        {duktape, log, #{level := debug, message := <<"debug message">>}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang.log with explicit level
+erlang_log_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"Erlang.log('warning', 'test', 123)">>),
+    receive
+        {duktape, log, #{level := warning, message := <<"test 123">>}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang.emit sends custom event
+erlang_emit_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"Erlang.emit('custom', {foo: 'bar', num: 42})">>),
+    receive
+        {duktape, custom, #{<<"foo">> := <<"bar">>, <<"num">> := 42}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: No handler means silent ignore
+no_handler_silent_test() ->
+    {ok, Ctx} = duktape:new_context(),  %% No handler
+    %% These should not crash or block
+    {ok, undefined} = duktape:eval(Ctx, <<"console.log('ignored')">>),
+    {ok, undefined} = duktape:eval(Ctx, <<"Erlang.emit('ignored', {})">>),
+    {ok, 42} = duktape:eval(Ctx, <<"40 + 2">>),  %% Context still works
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Multiple log messages
+multiple_logs_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        console.log('first');
+        console.warn('second');
+        console.error('third');
+    ">>),
+    receive {duktape, log, #{level := info, message := <<"first">>}} -> ok
+    after 100 -> ?assert(false) end,
+    receive {duktape, log, #{level := warning, message := <<"second">>}} -> ok
+    after 100 -> ?assert(false) end,
+    receive {duktape, log, #{level := error, message := <<"third">>}} -> ok
+    after 100 -> ?assert(false) end,
+    ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: Event Framework - Erlang to JS communication
+%% ============================================================================
+
+%% Test: Erlang.on registers callback, send calls it
+send_callback_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        var received = null;
+        Erlang.on('test_event', function(data) {
+            received = data;
+            return 'callback called';
+        });
+    ">>),
+    %% Send to the callback
+    {ok, <<"callback called">>} = duktape:send(Ctx, test_event, #{value => 42}),
+    %% Verify the data was received
+    {ok, #{<<"value">> := 42}} = duktape:eval(Ctx, <<"received">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: send with no callback returns ok
+send_no_callback_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ?assertEqual(ok, duktape:send(Ctx, nonexistent, #{})),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang.off removes callback
+callback_off_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        var callCount = 0;
+        Erlang.on('event', function() { callCount++; return callCount; });
+    ">>),
+    %% First send should work
+    {ok, 1} = duktape:send(Ctx, event, #{}),
+    {ok, 1} = duktape:eval(Ctx, <<"callCount">>),
+    %% Unregister callback
+    {ok, undefined} = duktape:eval(Ctx, <<"Erlang.off('event')">>),
+    %% Send should now be a no-op
+    ?assertEqual(ok, duktape:send(Ctx, event, #{})),
+    {ok, 1} = duktape:eval(Ctx, <<"callCount">>),  %% Still 1
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: send with binary event name
+send_binary_event_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        Erlang.on('my-event', function(d) { return d.x * 2; });
+    ">>),
+    {ok, 84} = duktape:send(Ctx, <<"my-event">>, #{x => 42}),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: callback throws error
+send_callback_error_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        Erlang.on('error_event', function() { throw 'oops'; });
+    ">>),
+    Result = duktape:send(Ctx, error_event, #{}),
+    ?assertMatch({error, {js_error, _}}, Result),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: multiple callbacks for different events
+multiple_callbacks_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        Erlang.on('add', function(d) { return d.a + d.b; });
+        Erlang.on('mul', function(d) { return d.a * d.b; });
+    ">>),
+    {ok, 7} = duktape:send(Ctx, add, #{a => 3, b => 4}),
+    {ok, 12} = duktape:send(Ctx, mul, #{a => 3, b => 4}),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: bidirectional communication
+bidirectional_test() ->
+    {ok, Ctx} = duktape:new_context(#{handler => self()}),
+    {ok, undefined} = duktape:eval(Ctx, <<"
+        var processed = [];
+        Erlang.on('process', function(data) {
+            var result = data.value * 2;
+            Erlang.emit('result', {input: data.value, output: result});
+            processed.push(result);
+            return result;
+        });
+    ">>),
+    %% Send for processing
+    {ok, 84} = duktape:send(Ctx, process, #{value => 42}),
+    %% Should receive result event
+    receive
+        {duktape, result, #{<<"input">> := 42, <<"output">> := 84}} ->
+            ok
+    after 1000 ->
+        ?assert(false)
+    end,
+    %% Verify internal state
+    {ok, [84]} = duktape:eval(Ctx, <<"processed">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang global object exists
+erlang_object_exists_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof Erlang.emit">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof Erlang.log">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof Erlang.on">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof Erlang.off">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: console object exists
+console_object_exists_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof console.log">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof console.info">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof console.warn">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof console.error">>),
+    {ok, <<"function">>} = duktape:eval(Ctx, <<"typeof console.debug">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Erlang Function Registration Tests
+%% ============================================================================
+
+%% Test: Basic Erlang function call from JavaScript
+register_function_basic_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, greet, fun([Name]) ->
+        <<"Hello, ", Name/binary, "!">>
+    end),
+    {ok, <<"Hello, World!">>} = duktape:eval(Ctx, <<"greet('World')">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function with multiple arguments
+register_function_multi_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, add, fun(Args) ->
+        lists:sum(Args)
+    end),
+    {ok, 10} = duktape:eval(Ctx, <<"add(1, 2, 3, 4)">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function with no arguments
+register_function_no_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, get_value, fun([]) ->
+        42
+    end),
+    {ok, 42} = duktape:eval(Ctx, <<"get_value()">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function returning complex types
+register_function_complex_return_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Note: [1, 2, 3] is converted to binary (iolist detection)
+    %% Use values > 255 to avoid iolist conversion
+    ok = duktape:register_function(Ctx, get_data, fun([]) ->
+        #{name => <<"test">>, values => [100, 200, 300]}
+    end),
+    {ok, #{<<"name">> := <<"test">>, <<"values">> := [100, 200, 300]}} =
+        duktape:eval(Ctx, <<"get_data()">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function called from JS function
+register_function_from_js_func_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, double, fun([N]) -> N * 2 end),
+    {ok, _} = duktape:eval(Ctx, <<"function quadruple(n) { return double(double(n)); }">>),
+    {ok, 20} = duktape:eval(Ctx, <<"quadruple(5)">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Multiple Erlang functions chained
+register_function_multiple_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, add1, fun([N]) -> N + 1 end),
+    ok = duktape:register_function(Ctx, mul2, fun([N]) -> N * 2 end),
+    %% mul2(add1(2)) = mul2(3) = 6
+    {ok, 6} = duktape:eval(Ctx, <<"mul2(add1(2))">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function error handling
+register_function_error_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, fail, fun(_) ->
+        error(intentional_error)
+    end),
+    {error, {js_error, ErrMsg}} = duktape:eval(Ctx, <<"fail()">>),
+    true = binary:match(ErrMsg, <<"error:">>) =/= nomatch,
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function with binary name
+register_function_binary_name_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, <<"my_func">>, fun([X]) -> X + 1 end),
+    {ok, 6} = duktape:eval(Ctx, <<"my_func(5)">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function receiving complex JS objects
+register_function_complex_args_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, process_data, fun([Data]) ->
+        #{<<"a">> := A, <<"b">> := B} = Data,
+        A + B
+    end),
+    {ok, 7} = duktape:eval(Ctx, <<"process_data({a: 3, b: 4})">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function called via call/3
+register_function_via_call_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, sum_list, fun(Args) ->
+        lists:sum(Args)
+    end),
+    {ok, _} = duktape:eval(Ctx, <<"function wrap() { return sum_list(1,2,3); }">>),
+    {ok, 6} = duktape:call(Ctx, wrap, []),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function with throw
+register_function_throw_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, maybe_throw, fun([ShouldThrow]) ->
+        case ShouldThrow of
+            true -> throw(thrown_error);
+            false -> ok
+        end
+    end),
+    {ok, <<"ok">>} = duktape:eval(Ctx, <<"maybe_throw(false)">>),
+    {error, {js_error, _}} = duktape:eval(Ctx, <<"maybe_throw(true)">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: JavaScript try/catch with Erlang function error
+register_function_js_catch_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, bad_func, fun(_) -> error(oops) end),
+    {ok, <<"caught">>} = duktape:eval(Ctx, <<"
+        try {
+            bad_func();
+        } catch (e) {
+            'caught';
+        }
+    ">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Multiple sequential calls to Erlang function
+register_function_sequential_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, inc, fun([N]) -> N + 1 end),
+    {ok, 1} = duktape:eval(Ctx, <<"inc(0)">>),
+    {ok, 2} = duktape:eval(Ctx, <<"inc(1)">>),
+    {ok, 3} = duktape:eval(Ctx, <<"inc(2)">>),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: Erlang function registered with atom returns atom as string
+register_function_atom_return_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:register_function(Ctx, get_status, fun([]) -> ok end),
+    {ok, <<"ok">>} = duktape:eval(Ctx, <<"get_status()">>),
+    ok = duktape:destroy_context(Ctx).

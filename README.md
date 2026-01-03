@@ -10,6 +10,9 @@ This library embeds the [Duktape](https://duktape.org/) JavaScript engine (v2.7.
 - Bidirectional type conversion between Erlang and JavaScript
 - Multiple isolated JavaScript contexts
 - CommonJS module support
+- **Event framework for JS ↔ Erlang communication**
+- **Register Erlang functions callable from JavaScript**
+- **console.log/info/warn/error/debug support**
 - Thread-safe with automatic resource cleanup
 - No external dependencies - Duktape is embedded
 
@@ -70,6 +73,22 @@ ok = duktape:register_module(Ctx, <<"utils">>, <<"
 Create a new JavaScript context. Contexts are isolated - variables and functions defined in one context are not visible in others.
 
 Contexts are automatically cleaned up when garbage collected, but you can also explicitly destroy them with `destroy_context/1`.
+
+#### `new_context(Opts) -> {ok, context()} | {error, term()}`
+
+Create a new JavaScript context with options.
+
+Options:
+- `handler => pid()`: Process to receive events from JavaScript. The handler will receive messages of the form `{duktape, Type, Data}` where Type is an atom (e.g., `log`) and Data is the event payload.
+
+```erlang
+{ok, Ctx} = duktape:new_context(#{handler => self()}),
+{ok, _} = duktape:eval(Ctx, <<"console.log('hello')">>),
+receive
+    {duktape, log, #{level := info, message := <<"hello">>}} ->
+        io:format("Got log message~n")
+end.
+```
 
 #### `destroy_context(Ctx) -> ok | {error, term()}`
 
@@ -138,6 +157,167 @@ Load a CommonJS module and return its exports. Modules are cached - subsequent r
 ```erlang
 {ok, Exports} = duktape:require(Ctx, <<"math">>).
 ```
+
+### Event Framework
+
+The event framework enables bidirectional communication between JavaScript and Erlang.
+
+#### `send(Ctx, Event, Data) -> {ok, Value} | ok | {error, term()}`
+
+Send data to a registered JavaScript callback. If JavaScript code has registered a callback using `Erlang.on(event, fn)`, this function will call that callback with the provided data.
+
+Returns `{ok, Result}` where Result is the return value of the callback, or `ok` if no callback is registered for the event.
+
+```erlang
+{ok, Ctx} = duktape:new_context(),
+%% JavaScript registers a callback
+{ok, _} = duktape:eval(Ctx, <<"
+    var received = null;
+    Erlang.on('data', function(d) { received = d; return 'got it'; });
+">>),
+%% Erlang sends data to the callback
+{ok, <<"got it">>} = duktape:send(Ctx, data, #{value => 42}),
+{ok, #{<<"value">> := 42}} = duktape:eval(Ctx, <<"received">>).
+```
+
+#### JavaScript API
+
+The `Erlang` global object provides the following methods:
+
+**`Erlang.emit(type, data)`** - Send an event to the Erlang handler process.
+
+```javascript
+Erlang.emit('custom_event', {key: 'value', count: 42});
+```
+
+The handler receives: `{duktape, custom_event, #{<<"key">> => <<"value">>, <<"count">> => 42}}`
+
+**`Erlang.log(level, ...args)`** - Send a log message to the Erlang handler.
+
+```javascript
+Erlang.log('info', 'User logged in:', userId);
+Erlang.log('warning', 'Rate limit exceeded');
+Erlang.log('error', 'Connection failed:', error);
+Erlang.log('debug', 'Request details:', request);
+```
+
+The handler receives: `{duktape, log, #{level => info, message => <<"User logged in: 123">>}}`
+
+**`Erlang.on(event, callback)`** - Register a callback for events from Erlang.
+
+```javascript
+Erlang.on('config_update', function(config) {
+    applyConfig(config);
+    return 'applied';
+});
+```
+
+**`Erlang.off(event)`** - Unregister a callback.
+
+```javascript
+Erlang.off('config_update');
+```
+
+#### Console Object
+
+A standard `console` object is available that wraps `Erlang.log`:
+
+```javascript
+console.log('Hello, world!');      // level: info
+console.info('Information');        // level: info
+console.warn('Warning message');    // level: warning
+console.error('Error occurred');    // level: error
+console.debug('Debug info');        // level: debug
+```
+
+#### Complete Example
+
+```erlang
+%% Create context with event handler
+{ok, Ctx} = duktape:new_context(#{handler => self()}),
+
+%% Set up JavaScript callback
+{ok, _} = duktape:eval(Ctx, <<"
+    var messages = [];
+    Erlang.on('message', function(msg) {
+        messages.push(msg);
+        console.log('Received:', msg.text);
+        return messages.length;
+    });
+">>),
+
+%% Send from Erlang
+{ok, 1} = duktape:send(Ctx, message, #{text => <<"Hello">>}),
+{ok, 2} = duktape:send(Ctx, message, #{text => <<"World">>}),
+
+%% Receive console.log events
+receive {duktape, log, #{message := <<"Received: Hello">>}} -> ok end,
+receive {duktape, log, #{message := <<"Received: World">>}} -> ok end,
+
+%% Verify messages were stored
+{ok, [#{<<"text">> := <<"Hello">>}, #{<<"text">> := <<"World">>}]} =
+    duktape:eval(Ctx, <<"messages">>).
+```
+
+### Erlang Functions
+
+Register Erlang functions that can be called synchronously from JavaScript.
+
+#### `register_function(Ctx, Name, Fun) -> ok | {error, term()}`
+
+Register an Erlang function callable from JavaScript. The function receives a list of arguments passed from JavaScript.
+
+Supports both anonymous functions and `{Module, Function}` tuples. The function must accept a single argument (the list of JS arguments).
+
+```erlang
+{ok, Ctx} = duktape:new_context(),
+
+%% Register with anonymous function
+ok = duktape:register_function(Ctx, greet, fun([Name]) ->
+    <<"Hello, ", Name/binary, "!">>
+end),
+{ok, <<"Hello, World!">>} = duktape:eval(Ctx, <<"greet('World')">>).
+
+%% Register with {Module, Function} tuple
+ok = duktape:register_function(Ctx, my_func, {my_module, my_function}).
+```
+
+**Multiple Arguments:**
+
+```erlang
+ok = duktape:register_function(Ctx, add, fun(Args) ->
+    lists:sum(Args)
+end),
+{ok, 10} = duktape:eval(Ctx, <<"add(1, 2, 3, 4)">>).
+```
+
+**Nested Calls (Erlang functions calling each other):**
+
+```erlang
+ok = duktape:register_function(Ctx, double, fun([N]) -> N * 2 end),
+{ok, _} = duktape:eval(Ctx, <<"function quadruple(n) { return double(double(n)); }">>),
+{ok, 20} = duktape:eval(Ctx, <<"quadruple(5)">>).
+```
+
+**Error Handling:**
+
+Erlang exceptions are converted to JavaScript errors:
+
+```erlang
+ok = duktape:register_function(Ctx, fail, fun(_) ->
+    error(something_bad)
+end),
+%% JavaScript can catch the error
+{ok, _} = duktape:eval(Ctx, <<"
+    try {
+        fail();
+    } catch (e) {
+        console.log('Caught:', e.message);
+    }
+">>).
+```
+
+**Note:** Registered functions are stored in the calling process's dictionary. The process that registers the function must also be the one that calls `eval/call`.
 
 ### Utility
 
