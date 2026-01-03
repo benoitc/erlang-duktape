@@ -169,6 +169,11 @@ metrics_alloc(void *udata, duk_size_t size)
         return NULL;
     }
 
+    /* Check for integer overflow before adding header size */
+    if (size > SIZE_MAX - MEM_HEADER_SIZE) {
+        return NULL;
+    }
+
     /* Allocate with header */
     mem_header_t *header = (mem_header_t *)enif_alloc(MEM_HEADER_SIZE + size);
     if (!header) {
@@ -211,6 +216,11 @@ metrics_realloc(void *udata, void *ptr, duk_size_t size)
 
     mem_header_t *old_header = ((mem_header_t *)ptr) - 1;
     size_t old_size = old_header->size;
+
+    /* Check for integer overflow before adding header size */
+    if (size > SIZE_MAX - MEM_HEADER_SIZE) {
+        return NULL;
+    }
 
     /* Reallocate with header */
     mem_header_t *new_header = (mem_header_t *)enif_realloc(old_header, MEM_HEADER_SIZE + size);
