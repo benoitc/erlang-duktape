@@ -1623,3 +1623,123 @@ cbor_decode_badarg_test() ->
     {ok, Ctx} = duktape:new_context(),
     ?assertMatch({error, badarg}, duktape:cbor_decode(Ctx, not_binary)),
     ok = duktape:destroy_context(Ctx).
+
+%% ============================================================================
+%% Test: Memory metrics and garbage collection
+%% ============================================================================
+
+%% Test: get_memory_stats returns valid map
+memory_stats_basic_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, Stats} = duktape:get_memory_stats(Ctx),
+    ?assert(is_map(Stats)),
+    ?assert(maps:is_key(heap_bytes, Stats)),
+    ?assert(maps:is_key(heap_peak, Stats)),
+    ?assert(maps:is_key(alloc_count, Stats)),
+    ?assert(maps:is_key(realloc_count, Stats)),
+    ?assert(maps:is_key(free_count, Stats)),
+    ?assert(maps:is_key(gc_runs, Stats)),
+    %% Heap should have some bytes allocated (Duktape uses memory on init)
+    ?assert(maps:get(heap_bytes, Stats) > 0),
+    ?assert(maps:get(heap_peak, Stats) > 0),
+    ?assert(maps:get(alloc_count, Stats) > 0),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: memory increases after allocations
+memory_stats_allocation_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, StatsBefore} = duktape:get_memory_stats(Ctx),
+    HeapBefore = maps:get(heap_bytes, StatsBefore),
+    %% Allocate a large array in JS
+    {ok, _} = duktape:eval(Ctx, <<"
+        var arr = [];
+        for (var i = 0; i < 10000; i++) {
+            arr.push({index: i, value: 'test' + i});
+        }
+        arr.length;
+    ">>),
+    {ok, StatsAfter} = duktape:get_memory_stats(Ctx),
+    HeapAfter = maps:get(heap_bytes, StatsAfter),
+    %% Memory should have increased significantly
+    ?assert(HeapAfter > HeapBefore),
+    ?assert((HeapAfter - HeapBefore) > 10000),  %% At least 10KB more
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: peak memory tracks maximum usage
+memory_stats_peak_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Allocate then release memory
+    {ok, _} = duktape:eval(Ctx, <<"
+        var x = [];
+        for (var i = 0; i < 5000; i++) x.push('data' + i);
+        x = null;
+    ">>),
+    ok = duktape:gc(Ctx),
+    {ok, Stats} = duktape:get_memory_stats(Ctx),
+    %% Peak should be >= current (peak captures max allocation)
+    ?assert(maps:get(heap_peak, Stats) >= maps:get(heap_bytes, Stats)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: gc function works and increments counter
+gc_basic_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, StatsBefore} = duktape:get_memory_stats(Ctx),
+    ?assertEqual(0, maps:get(gc_runs, StatsBefore)),
+    ok = duktape:gc(Ctx),
+    {ok, StatsAfter1} = duktape:get_memory_stats(Ctx),
+    ?assertEqual(1, maps:get(gc_runs, StatsAfter1)),
+    ok = duktape:gc(Ctx),
+    {ok, StatsAfter2} = duktape:get_memory_stats(Ctx),
+    ?assertEqual(2, maps:get(gc_runs, StatsAfter2)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: gc can reclaim memory
+gc_reclaim_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    %% Create and discard objects
+    {ok, _} = duktape:eval(Ctx, <<"
+        for (var i = 0; i < 1000; i++) {
+            var obj = {data: [], index: i};
+            for (var j = 0; j < 100; j++) obj.data.push(j);
+        }
+    ">>),
+    {ok, StatsBefore} = duktape:get_memory_stats(Ctx),
+    ok = duktape:gc(Ctx),
+    {ok, StatsAfter} = duktape:get_memory_stats(Ctx),
+    %% Memory should decrease or stay same after GC
+    %% (Duktape may not immediately release all memory, but it shouldn't grow)
+    ?assert(maps:get(heap_bytes, StatsAfter) =< maps:get(heap_bytes, StatsBefore)),
+    ok = duktape:destroy_context(Ctx).
+
+%% Test: memory stats on destroyed context returns error
+memory_stats_destroyed_context_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:destroy_context(Ctx),
+    ?assertMatch({error, invalid_context}, duktape:get_memory_stats(Ctx)).
+
+%% Test: gc on destroyed context returns error
+gc_destroyed_context_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    ok = duktape:destroy_context(Ctx),
+    ?assertMatch({error, invalid_context}, duktape:gc(Ctx)).
+
+%% Test: memory stats with invalid context
+memory_stats_invalid_context_test() ->
+    ?assertMatch({error, invalid_context}, duktape:get_memory_stats(not_a_context)).
+
+%% Test: gc with invalid context
+gc_invalid_context_test() ->
+    ?assertMatch({error, invalid_context}, duktape:gc(not_a_context)).
+
+%% Test: alloc and free counts increase with operations
+memory_stats_counts_test() ->
+    {ok, Ctx} = duktape:new_context(),
+    {ok, StatsBefore} = duktape:get_memory_stats(Ctx),
+    AllocBefore = maps:get(alloc_count, StatsBefore),
+    %% Do some work
+    {ok, _} = duktape:eval(Ctx, <<"var x = {a: 1, b: 2, c: [1,2,3]};">>),
+    {ok, StatsAfter} = duktape:get_memory_stats(Ctx),
+    AllocAfter = maps:get(alloc_count, StatsAfter),
+    %% Should have more allocations
+    ?assert(AllocAfter > AllocBefore),
+    ok = duktape:destroy_context(Ctx).

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-01-03
+
+### Added
+
+- **Memory Metrics**: Real-time heap usage tracking with custom allocator
+  - `get_memory_stats/1` - returns heap_bytes, heap_peak, alloc_count, realloc_count, free_count, gc_runs
+  - `gc/1` - manually trigger Duktape garbage collection
+  - Per-context memory tracking via custom allocator wrapper
+  - 10 new tests for metrics functionality (173 total)
+
+### Changed
+
+- **Dirty NIF Scheduling**: CPU-bound operations now run on dirty schedulers
+  - `eval`, `eval_bindings`, `call`, `require`, `eval_resume` marked as `ERL_NIF_DIRTY_JOB_CPU_BOUND`
+  - `cbor_encode`, `cbor_decode` marked as `ERL_NIF_DIRTY_JOB_CPU_BOUND`
+  - Prevents blocking of Erlang scheduler threads during JavaScript execution
+  - Fast operations (context creation, registration) remain on normal scheduler
+
 ## [0.2.0] - 2026-01-03
 
 ### Added

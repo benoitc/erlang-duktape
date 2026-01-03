@@ -16,6 +16,7 @@ This library embeds the [Duktape](https://duktape.org/) JavaScript engine (v2.7.
 - **Event framework for JS ↔ Erlang communication**
 - **Register Erlang functions callable from JavaScript**
 - **console.log/info/warn/error/debug support**
+- **Memory metrics and manual garbage collection**
 - Thread-safe with automatic resource cleanup
 - No external dependencies - Duktape is embedded
 
@@ -352,6 +353,40 @@ CBOR type mappings follow the same rules as regular Erlang ↔ JavaScript type c
 
 Get NIF information. Used to verify the NIF is loaded correctly.
 
+### Metrics
+
+#### `get_memory_stats(Ctx) -> {ok, Stats} | {error, term()}`
+
+Get memory statistics for a JavaScript context. Returns a map with:
+
+| Key | Description |
+|-----|-------------|
+| `heap_bytes` | Current allocated bytes in the Duktape heap |
+| `heap_peak` | Peak memory usage since context creation |
+| `alloc_count` | Total number of allocations |
+| `realloc_count` | Total number of reallocations |
+| `free_count` | Total number of frees |
+| `gc_runs` | Number of garbage collection runs triggered |
+
+```erlang
+{ok, Ctx} = duktape:new_context(),
+{ok, _} = duktape:eval(Ctx, <<"var x = []; for(var i=0; i<1000; i++) x.push(i);">>),
+{ok, Stats} = duktape:get_memory_stats(Ctx),
+io:format("Heap: ~p bytes, Peak: ~p bytes~n",
+          [maps:get(heap_bytes, Stats), maps:get(heap_peak, Stats)]).
+```
+
+#### `gc(Ctx) -> ok | {error, term()}`
+
+Trigger garbage collection on a JavaScript context. Forces Duktape's mark-and-sweep garbage collector to run.
+
+```erlang
+{ok, Ctx} = duktape:new_context(),
+{ok, _} = duktape:eval(Ctx, <<"var x = {}; x = null;">>),
+ok = duktape:gc(Ctx),
+{ok, #{gc_runs := 1}} = duktape:get_memory_stats(Ctx).
+```
+
 ## Type Conversions
 
 ### Erlang to JavaScript
@@ -419,51 +454,51 @@ Performance benchmarks on Apple M4 Pro, Erlang/OTP 28:
 
 | Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
 |-----------|--------:|----------:|---------:|---------:|
-| eval_simple | 1,923 | 0.520 | 0.565 | 0.611 |
-| eval_complex | 1,779 | 0.562 | 0.588 | 0.621 |
-| eval_bindings_small (5 vars) | 1,918 | 0.522 | 0.540 | 0.561 |
-| eval_bindings_large (50 vars) | 1,273 | 0.785 | 0.903 | 0.936 |
-| call_no_args | 1,609 | 0.621 | 0.682 | 0.695 |
-| call_with_args (5 args) | 1,620 | 0.617 | 0.697 | 0.720 |
-| call_many_args (20 args) | 1,499 | 0.667 | 0.757 | 0.795 |
-| type_convert_simple | 1,682 | 0.594 | 0.664 | 0.688 |
-| type_convert_array (1000 elem) | 1,501 | 0.666 | 0.751 | 0.785 |
-| type_convert_nested | 1,631 | 0.613 | 0.690 | 0.717 |
-| context_create | 1,773 | 0.564 | 0.640 | 0.665 |
-| module_require_cached | 1,500 | 0.667 | 0.739 | 0.776 |
+| eval_simple | 1,866 | 0.536 | 0.561 | 0.581 |
+| eval_complex | 1,712 | 0.584 | 0.613 | 0.654 |
+| eval_bindings_small (5 vars) | 1,815 | 0.551 | 0.602 | 0.650 |
+| eval_bindings_large (50 vars) | 1,292 | 0.774 | 0.852 | 0.890 |
+| call_no_args | 1,736 | 0.576 | 0.626 | 0.672 |
+| call_with_args (5 args) | 1,730 | 0.578 | 0.624 | 0.683 |
+| call_many_args (20 args) | 1,604 | 0.624 | 0.666 | 0.730 |
+| type_convert_simple | 1,842 | 0.543 | 0.574 | 0.648 |
+| type_convert_array (1000 elem) | 1,616 | 0.619 | 0.656 | 0.732 |
+| type_convert_nested | 1,773 | 0.564 | 0.599 | 0.670 |
+| context_create | 1,960 | 0.510 | 0.540 | 0.609 |
+| module_require_cached | 1,636 | 0.611 | 0.642 | 0.712 |
 
 ### Erlang Function Registration
 
 | Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
 |-----------|--------:|----------:|---------:|---------:|
-| register_function_simple | 1,602 | 0.624 | 0.680 | 0.722 |
-| register_function_complex_args | 1,456 | 0.687 | 0.748 | 1.320 |
-| register_function_nested (5 calls) | 1,379 | 0.725 | 0.800 | 0.846 |
-| register_function_many_calls (10) | 9,471 | 1.056 | 1.170 | 1.251 |
+| register_function_simple | 1,794 | 0.557 | 0.582 | 0.680 |
+| register_function_complex_args | 1,616 | 0.619 | 0.658 | 1.091 |
+| register_function_nested (5 calls) | 1,445 | 0.692 | 0.746 | 0.817 |
+| register_function_many_calls (10) | 9,682 | 1.033 | 1.114 | 1.268 |
 
 ### Event Framework
 
 | Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
 |-----------|--------:|----------:|---------:|---------:|
-| event_emit | 1,368 | 0.731 | 0.822 | 0.857 |
-| event_send | 1,602 | 0.624 | 0.689 | 0.710 |
-| console_log | 1,342 | 0.745 | 0.820 | 0.863 |
+| event_emit | 1,488 | 0.672 | 0.717 | 0.804 |
+| event_send | 1,787 | 0.560 | 0.584 | 0.659 |
+| console_log | 1,486 | 0.673 | 0.712 | 0.794 |
 
 ### CBOR Encoding/Decoding
 
 | Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
 |-----------|--------:|----------:|---------:|---------:|
-| cbor_encode_simple | 1,728 | 0.579 | 0.643 | 0.668 |
-| cbor_encode_complex | 1,666 | 0.600 | 0.664 | 0.684 |
-| cbor_decode_simple | 1,677 | 0.596 | 0.655 | 0.686 |
-| cbor_roundtrip | 1,662 | 0.602 | 0.668 | 0.701 |
+| cbor_encode_simple | 1,920 | 0.521 | 0.545 | 0.615 |
+| cbor_encode_complex | 1,833 | 0.545 | 0.589 | 0.653 |
+| cbor_decode_simple | 1,891 | 0.529 | 0.558 | 0.647 |
+| cbor_roundtrip | 1,853 | 0.540 | 0.577 | 0.676 |
 
 ### Concurrency
 
 | Benchmark | Ops/sec | Mean (ms) | P95 (ms) | P99 (ms) |
 |-----------|--------:|----------:|---------:|---------:|
-| concurrent_same_context (10 procs) | 53,268 | 1.877 | 2.207 | 2.365 |
-| concurrent_many_contexts (10 procs) | 23,290 | 4.294 | 4.964 | 5.240 |
+| concurrent_same_context (10 procs) | 45,306 | 2.207 | 2.439 | 2.543 |
+| concurrent_many_contexts (10 procs) | 26,253 | 3.809 | 4.185 | 4.491 |
 
 Run benchmarks yourself:
 

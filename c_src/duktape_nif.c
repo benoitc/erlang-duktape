@@ -67,12 +67,24 @@ make_binary_from_string(ErlNifEnv *env, const char *str, size_t len, ERL_NIF_TER
  * Types and structures
  * ============================================================================ */
 
+/* Memory metrics for tracking heap usage */
+typedef struct {
+    size_t heap_bytes;          /* Current allocated bytes */
+    size_t heap_peak;           /* Peak memory usage */
+    size_t alloc_count;         /* Total allocation count */
+    size_t realloc_count;       /* Total reallocation count */
+    size_t free_count;          /* Total free count */
+    size_t gc_runs;             /* Number of GC runs triggered */
+} duktape_metrics_t;
+
 /* Duktape context wrapper with reference counting */
 typedef struct {
     duk_context *ctx;           /* The Duktape heap/context */
     ErlNifMutex *lock;          /* Mutex for thread safety */
     int ref_count;              /* Reference count */
     int destroyed;              /* Flag indicating context was explicitly destroyed */
+    /* Memory metrics */
+    duktape_metrics_t metrics;  /* Memory tracking stats */
     /* Event handling */
     ErlNifEnv *event_env;       /* Env for sending events to Erlang */
     ErlNifPid handler_pid;      /* Handler process for events */
@@ -121,6 +133,123 @@ static ERL_NIF_TERM atom_message;
 static ERL_NIF_TERM atom_handler;
 /* Erlang function call atoms */
 static ERL_NIF_TERM atom_call_erlang;
+
+/* Metrics atoms */
+static ERL_NIF_TERM atom_heap_bytes;
+static ERL_NIF_TERM atom_heap_peak;
+static ERL_NIF_TERM atom_alloc_count;
+static ERL_NIF_TERM atom_realloc_count;
+static ERL_NIF_TERM atom_free_count;
+static ERL_NIF_TERM atom_gc_runs;
+
+/* ============================================================================
+ * Custom memory allocator for metrics tracking
+ * ============================================================================ */
+
+/*
+ * Memory block header - prepended to each allocation to track size.
+ * This allows us to track memory usage accurately on free().
+ */
+typedef struct {
+    size_t size;
+} mem_header_t;
+
+#define MEM_HEADER_SIZE sizeof(mem_header_t)
+
+/*
+ * Custom allocator function for Duktape.
+ * Allocates memory with a header to track size.
+ */
+static void *
+metrics_alloc(void *udata, duk_size_t size)
+{
+    duktape_ctx_t *res = (duktape_ctx_t *)udata;
+
+    if (size == 0) {
+        return NULL;
+    }
+
+    /* Allocate with header */
+    mem_header_t *header = (mem_header_t *)enif_alloc(MEM_HEADER_SIZE + size);
+    if (!header) {
+        return NULL;
+    }
+
+    header->size = size;
+
+    /* Update metrics */
+    res->metrics.heap_bytes += size;
+    res->metrics.alloc_count++;
+    if (res->metrics.heap_bytes > res->metrics.heap_peak) {
+        res->metrics.heap_peak = res->metrics.heap_bytes;
+    }
+
+    return (void *)(header + 1);
+}
+
+/*
+ * Custom realloc function for Duktape.
+ */
+static void *
+metrics_realloc(void *udata, void *ptr, duk_size_t size)
+{
+    duktape_ctx_t *res = (duktape_ctx_t *)udata;
+
+    /* realloc(NULL, size) is like malloc(size) */
+    if (ptr == NULL) {
+        return metrics_alloc(udata, size);
+    }
+
+    /* realloc(ptr, 0) is like free(ptr) */
+    if (size == 0) {
+        mem_header_t *header = ((mem_header_t *)ptr) - 1;
+        res->metrics.heap_bytes -= header->size;
+        res->metrics.free_count++;
+        enif_free(header);
+        return NULL;
+    }
+
+    mem_header_t *old_header = ((mem_header_t *)ptr) - 1;
+    size_t old_size = old_header->size;
+
+    /* Reallocate with header */
+    mem_header_t *new_header = (mem_header_t *)enif_realloc(old_header, MEM_HEADER_SIZE + size);
+    if (!new_header) {
+        return NULL;
+    }
+
+    new_header->size = size;
+
+    /* Update metrics */
+    res->metrics.heap_bytes = res->metrics.heap_bytes - old_size + size;
+    res->metrics.realloc_count++;
+    if (res->metrics.heap_bytes > res->metrics.heap_peak) {
+        res->metrics.heap_peak = res->metrics.heap_bytes;
+    }
+
+    return (void *)(new_header + 1);
+}
+
+/*
+ * Custom free function for Duktape.
+ */
+static void
+metrics_free(void *udata, void *ptr)
+{
+    duktape_ctx_t *res = (duktape_ctx_t *)udata;
+
+    if (ptr == NULL) {
+        return;
+    }
+
+    mem_header_t *header = ((mem_header_t *)ptr) - 1;
+
+    /* Update metrics */
+    res->metrics.heap_bytes -= header->size;
+    res->metrics.free_count++;
+
+    enif_free(header);
+}
 
 /* ============================================================================
  * Resource management
@@ -844,6 +973,8 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     res->lock = NULL;
     res->ref_count = 1;
     res->destroyed = 0;
+    /* Initialize metrics */
+    memset(&res->metrics, 0, sizeof(duktape_metrics_t));
     res->event_env = NULL;
     res->handler_enabled = 0;
     /* Initialize pending call fields */
@@ -863,8 +994,9 @@ nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error, atom_enomem);
     }
 
-    /* Create the Duktape heap */
-    res->ctx = duk_create_heap_default();
+    /* Create the Duktape heap with custom allocator for metrics tracking */
+    res->ctx = duk_create_heap(metrics_alloc, metrics_realloc, metrics_free,
+                               (void *)res, NULL);
     if (!res->ctx) {
         enif_mutex_destroy(res->lock);
         res->lock = NULL;
@@ -961,6 +1093,8 @@ nif_new_context_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     res->lock = NULL;
     res->ref_count = 1;
     res->destroyed = 0;
+    /* Initialize metrics */
+    memset(&res->metrics, 0, sizeof(duktape_metrics_t));
     res->event_env = NULL;
     res->handler_enabled = 0;
     /* Initialize pending call fields */
@@ -998,8 +1132,9 @@ nif_new_context_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_tuple2(env, atom_error, atom_enomem);
     }
 
-    /* Create the Duktape heap */
-    res->ctx = duk_create_heap_default();
+    /* Create the Duktape heap with custom allocator for metrics tracking */
+    res->ctx = duk_create_heap(metrics_alloc, metrics_realloc, metrics_free,
+                               (void *)res, NULL);
     if (!res->ctx) {
         enif_mutex_destroy(res->lock);
         res->lock = NULL;
@@ -1981,6 +2116,91 @@ nif_cbor_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 }
 
 /* ============================================================================
+ * Metrics NIF functions
+ * ============================================================================ */
+
+/* Get memory statistics for a Duktape context */
+static ERL_NIF_TERM
+nif_get_memory_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Build metrics map */
+    ERL_NIF_TERM keys[6];
+    ERL_NIF_TERM values[6];
+
+    keys[0] = atom_heap_bytes;
+    values[0] = enif_make_uint64(env, res->metrics.heap_bytes);
+
+    keys[1] = atom_heap_peak;
+    values[1] = enif_make_uint64(env, res->metrics.heap_peak);
+
+    keys[2] = atom_alloc_count;
+    values[2] = enif_make_uint64(env, res->metrics.alloc_count);
+
+    keys[3] = atom_realloc_count;
+    values[3] = enif_make_uint64(env, res->metrics.realloc_count);
+
+    keys[4] = atom_free_count;
+    values[4] = enif_make_uint64(env, res->metrics.free_count);
+
+    keys[5] = atom_gc_runs;
+    values[5] = enif_make_uint64(env, res->metrics.gc_runs);
+
+    ERL_NIF_TERM map;
+    enif_make_map_from_arrays(env, keys, values, 6, &map);
+
+    enif_mutex_unlock(res->lock);
+
+    return enif_make_tuple2(env, atom_ok, map);
+}
+
+/* Trigger garbage collection on a Duktape context */
+static ERL_NIF_TERM
+nif_gc(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+
+    duktape_ctx_t *res;
+
+    /* Get the context */
+    res = get_context(env, argv[0]);
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    enif_mutex_lock(res->lock);
+
+    if (res->destroyed) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, atom_invalid_context);
+    }
+
+    /* Run garbage collection */
+    duk_gc(res->ctx, 0);
+    res->metrics.gc_runs++;
+
+    enif_mutex_unlock(res->lock);
+
+    return atom_ok;
+}
+
+/* ============================================================================
  * NIF initialization
  * ============================================================================ */
 
@@ -2027,6 +2247,14 @@ on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     /* Erlang function call atoms */
     atom_call_erlang = enif_make_atom(env, "call_erlang");
 
+    /* Metrics atoms */
+    atom_heap_bytes = enif_make_atom(env, "heap_bytes");
+    atom_heap_peak = enif_make_atom(env, "heap_peak");
+    atom_alloc_count = enif_make_atom(env, "alloc_count");
+    atom_realloc_count = enif_make_atom(env, "realloc_count");
+    atom_free_count = enif_make_atom(env, "free_count");
+    atom_gc_runs = enif_make_atom(env, "gc_runs");
+
     return 0;
 }
 
@@ -2047,23 +2275,34 @@ on_unload(ErlNifEnv *env, void *priv_data)
     (void)priv_data;
 }
 
-/* NIF function table */
+/* NIF function table
+ *
+ * CPU-bound operations that execute JavaScript or perform intensive
+ * serialization are marked as dirty NIFs to prevent blocking the
+ * Erlang scheduler. This is important because JavaScript execution
+ * time is unbounded and user-provided code could run indefinitely.
+ */
 static ErlNifFunc nif_funcs[] = {
+    /* Fast operations - run on normal scheduler */
     {"nif_info", 0, nif_info, 0},
     {"nif_new_context", 0, nif_new_context, 0},
     {"nif_new_context_opts", 1, nif_new_context_opts, 0},
     {"nif_destroy_context", 1, nif_destroy_context, 0},
-    {"nif_eval", 2, nif_eval, 0},
-    {"nif_eval_bindings", 3, nif_eval_bindings, 0},
-    {"nif_call", 3, nif_call, 0},
     {"nif_register_module", 3, nif_register_module, 0},
-    {"nif_require", 2, nif_require, 0},
     {"nif_send", 3, nif_send, 0},
     {"nif_register_erlang_function", 2, nif_register_erlang_function, 0},
     {"nif_call_complete", 2, nif_call_complete, 0},
-    {"nif_eval_resume", 1, nif_eval_resume, 0},
-    {"nif_cbor_encode", 2, nif_cbor_encode, 0},
-    {"nif_cbor_decode", 2, nif_cbor_decode, 0}
+    {"nif_get_memory_stats", 1, nif_get_memory_stats, 0},
+    {"nif_gc", 1, nif_gc, 0},
+
+    /* CPU-bound operations - run on dirty scheduler */
+    {"nif_eval", 2, nif_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_eval_bindings", 3, nif_eval_bindings, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_call", 3, nif_call, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_require", 2, nif_require, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_eval_resume", 1, nif_eval_resume, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_cbor_encode", 2, nif_cbor_encode, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_cbor_decode", 2, nif_cbor_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(duktape, nif_funcs, on_load, NULL, on_upgrade, on_unload)

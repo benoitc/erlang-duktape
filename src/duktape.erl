@@ -23,11 +23,14 @@
     send/3,
     register_function/3,
     cbor_encode/2,
-    cbor_decode/2
+    cbor_decode/2,
+    %% Metrics
+    get_memory_stats/1,
+    gc/1
 ]).
 
 %% Types
--export_type([context/0, js_value/0, bindings/0, context_opts/0]).
+-export_type([context/0, js_value/0, bindings/0, context_opts/0, memory_stats/0]).
 
 -opaque context() :: reference().
 
@@ -44,6 +47,15 @@
                   | #{binary() | atom() => js_value()}.
 
 -type bindings() :: #{atom() | binary() => term()}.
+
+-type memory_stats() :: #{
+    heap_bytes := non_neg_integer(),
+    heap_peak := non_neg_integer(),
+    alloc_count := non_neg_integer(),
+    realloc_count := non_neg_integer(),
+    free_count := non_neg_integer(),
+    gc_runs := non_neg_integer()
+}.
 
 %% NIF loading
 -compile(no_native).
@@ -269,6 +281,41 @@ cbor_encode(Ctx, Value) ->
 cbor_decode(Ctx, Binary) ->
     nif_cbor_decode(Ctx, Binary).
 
+%% @doc Get memory statistics for a JavaScript context.
+%% Returns a map with the following keys:
+%% - `heap_bytes': Current allocated bytes in the Duktape heap
+%% - `heap_peak': Peak memory usage since context creation
+%% - `alloc_count': Total number of allocations
+%% - `realloc_count': Total number of reallocations
+%% - `free_count': Total number of frees
+%% - `gc_runs': Number of garbage collection runs triggered
+%%
+%% Example:
+%% ```
+%% {ok, Ctx} = duktape:new_context(),
+%% {ok, _} = duktape:eval(Ctx, <<"var x = []; for(var i=0; i<1000; i++) x.push(i);">>),
+%% {ok, Stats} = duktape:get_memory_stats(Ctx),
+%% io:format("Heap: ~p bytes~n", [maps:get(heap_bytes, Stats)]).
+%% '''
+-spec get_memory_stats(context()) -> {ok, memory_stats()} | {error, term()}.
+get_memory_stats(Ctx) ->
+    nif_get_memory_stats(Ctx).
+
+%% @doc Trigger garbage collection on a JavaScript context.
+%% Forces Duktape's mark-and-sweep garbage collector to run.
+%% The gc_runs counter in memory stats will be incremented.
+%%
+%% Example:
+%% ```
+%% {ok, Ctx} = duktape:new_context(),
+%% {ok, _} = duktape:eval(Ctx, <<"var x = {}; x = null;">>),
+%% ok = duktape:gc(Ctx),
+%% {ok, #{gc_runs := 1}} = duktape:get_memory_stats(Ctx).
+%% '''
+-spec gc(context()) -> ok | {error, term()}.
+gc(Ctx) ->
+    nif_gc(Ctx).
+
 %% @doc Register an Erlang function callable from JavaScript.
 %% The function receives a list of arguments passed from JavaScript.
 %%
@@ -374,3 +421,5 @@ nif_call_complete(_Ctx, _Result) -> ?nif_stub.
 nif_eval_resume(_Ctx) -> ?nif_stub.
 nif_cbor_encode(_Ctx, _Value) -> ?nif_stub.
 nif_cbor_decode(_Ctx, _Binary) -> ?nif_stub.
+nif_get_memory_stats(_Ctx) -> ?nif_stub.
+nif_gc(_Ctx) -> ?nif_stub.
