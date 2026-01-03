@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Erlang.log(level, ...)` - structured logging
   - `console.log/info/warn/error/debug` support
 
-- New performance benchmarks for register_function and events
+- New performance benchmarks for register_function, events, and CBOR
 - Comprehensive test coverage (163 tests)
 
 ## [0.1.0] - 2025-01-03
