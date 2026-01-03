@@ -87,7 +87,7 @@ Contexts are automatically cleaned up when garbage collected, but you can also e
 Create a new JavaScript context with options.
 
 Options:
-- `handler => pid()`: Process to receive events from JavaScript. The handler will receive messages of the form `{duktape, Type, Data}` where Type is an atom (e.g., `log`) and Data is the event payload.
+- `handler => pid()`: Process to receive events from JavaScript. The handler will receive messages of the form `{duktape, Type, Data}` where Type is a binary (e.g., `<<"custom">>`) or atom (for log events: `log`) and Data is the event payload.
 
 ```erlang
 {ok, Ctx} = duktape:new_context(#{handler => self()}),
@@ -198,7 +198,7 @@ The `Erlang` global object provides the following methods:
 Erlang.emit('custom_event', {key: 'value', count: 42});
 ```
 
-The handler receives: `{duktape, custom_event, #{<<"key">> => <<"value">>, <<"count">> => 42}}`
+The handler receives: `{duktape, <<"custom_event">>, #{<<"key">> => <<"value">>, <<"count">> => 42}}`
 
 **`Erlang.log(level, ...args)`** - Send a log message to the Erlang handler.
 
@@ -511,6 +511,22 @@ Run benchmarks yourself:
 ./run_bench.sh eval_simple  # Run specific benchmark
 ./run_bench.sh --smoke      # Quick validation
 ```
+
+## Security Considerations
+
+When running untrusted JavaScript code, be aware of these limitations:
+
+### Execution Limits
+
+Duktape does not have built-in execution timeout. JavaScript code can:
+- Run infinite loops (blocks a dirty scheduler thread)
+- Allocate unbounded memory
+
+**Recommendation**: Only run trusted JavaScript, or implement application-level timeouts using Erlang's process monitoring.
+
+### Event Types
+
+Event types from `Erlang.emit()` are returned as binaries to prevent atom table exhaustion. Known log levels (`debug`, `info`, `warning`, `error`) remain atoms for ergonomics.
 
 ## License
 

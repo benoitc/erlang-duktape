@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Prevents blocking of Erlang scheduler threads during JavaScript execution
   - Fast operations (context creation, registration) remain on normal scheduler
 
+- **Event Types**: `Erlang.emit()` now returns event types as binaries instead of atoms
+  - Handler messages: `{duktape, <<"event_type">>, Data}`
+  - Prevents atom table exhaustion from malicious JavaScript
+
+### Security
+
+- **Integer overflow protection**: Added overflow check in custom memory allocator
+  - Validates allocation size before adding header in `metrics_alloc()` and `metrics_realloc()`
+
+- **Atom table exhaustion prevention**: Event types and unknown log levels returned as binaries
+  - Known log levels (debug, info, warning, error) remain atoms for ergonomics
+
 ## [0.2.0] - 2026-01-03
 
 ### Added

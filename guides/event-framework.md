@@ -46,9 +46,9 @@ JavaScript can emit events to the Erlang handler:
     Erlang.emit('user_action', {type: 'click', x: 100, y: 200});
 ">>).
 
-%% Receive the event
+%% Receive the event (event type is a binary)
 receive
-    {duktape_event, <<"user_action">>, Data} ->
+    {duktape, <<"user_action">>, Data} ->
         #{<<"type">> := <<"click">>, <<"x">> := 100, <<"y">> := 200} = Data
 end.
 ```
@@ -106,7 +106,7 @@ console.debug('Debug message');   // level: debug
 The handler receives:
 
 ```erlang
-{duktape_log, Level, Args}
+{duktape, log, #{level => info, message => <<"Info message">>}}
 ```
 
 ## Complete Example
@@ -145,7 +145,7 @@ run() ->
 
 receive_events() ->
     receive
-        {duktape_event, Event, Data} ->
+        {duktape, Event, Data} ->
             io:format("Event: ~p, Data: ~p~n", [Event, Data]),
             receive_events()
     after 0 ->
