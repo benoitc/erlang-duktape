@@ -8,7 +8,7 @@ Add `duktape` to your `rebar.config` dependencies:
 
 ```erlang
 {deps, [
-    {duktape, "0.3.0"}
+    {duktape, "1.0.0"}
 ]}.
 ```
 
